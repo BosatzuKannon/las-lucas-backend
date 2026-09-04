@@ -1,15 +1,168 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
-// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
-
 generator client {
-  provider = "prisma-client"
-  output   = "../generated/prisma"
+  provider = "prisma-client-js"
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")  
+}
+
+// --- ENUMS ---
+enum UserStatus {
+  ACTIVE
+  BANNED
+  INACTIVE
+}
+
+enum TransactionType {
+  RECHARGE
+  WITHDRAWAL
+  ENTRY_FEE
+  PRIZE
+  LIFE_PURCHASE
+}
+
+enum TransactionStatus {
+  PENDING
+  COMPLETED
+  FAILED
+}
+
+enum TournamentType {
+  DAILY
+  WEEKLY
+  BIWEEKLY
+  CUSTOM_DATE
+}
+
+enum RoomStatus {
+  WAITING
+  ACTIVE
+  FINISHED
+}
+
+// --- MODELS ---
+model User {
+  id                     String          @id @default(uuid())
+  googleId               String          @unique @map("google_id")
+  email                  String          @unique
+  name                   String
+  avatarUrl              String?         @map("avatar_url")
+  status                 UserStatus      @default(ACTIVE)
+  balanceLucas           Float           @default(0) @map("balance_lucas")
+  phone                  String?
+  identificationDocument String?         @map("identification_document")
+  createdAt              DateTime        @default(now()) @map("created_at")
+  updatedAt              DateTime        @updatedAt @map("updated_at")
+
+  // Relations
+  device                 Device?
+  preference             UserPreference?
+  transactions           Transaction[]
+  roomParticipations     RoomParticipant[]
+
+  @@map("users")
+}
+
+model Device {
+  id         String   @id @default(uuid())
+  userId     String   @unique @map("user_id")
+  pushToken  String?  @map("push_token")
+  deviceInfo Json?    @map("device_info")
+  lastLogin  DateTime @default(now()) @map("last_login")
+
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("devices")
+}
+
+model UserPreference {
+  id                 String  @id @default(uuid())
+  userId             String  @unique @map("user_id")
+  emailNotifications Boolean @default(true) @map("email_notifications")
+  pushNotifications  Boolean @default(true) @map("push_notifications")
+
+  user               User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_preferences")
+}
+
+model Transaction {
+  id                 String            @id @default(uuid())
+  userId             String            @map("user_id")
+  amount             Float
+  transactionType    TransactionType   @map("transaction_type")
+  status             TransactionStatus @default(PENDING)
+  reference          String?           @unique
+  wompiTransactionId String?           @unique @map("wompi_transaction_id")
+  paymentMethodType  String?           @map("payment_method_type")
+  paymentMethodExtra Json?             @map("payment_method_extra")
+  createdAt          DateTime          @default(now()) @map("created_at")
+
+  user               User              @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@map("transactions")
+}
+
+model Room {
+  id             String         @id @default(uuid())
+  tournamentType TournamentType @map("tournament_type")
+  status         RoomStatus     @default(WAITING)
+  entryFee       Float          @map("entry_fee")
+  extraLifeFee   Float          @map("extra_life_fee")
+  prizePool      Float          @map("prize_pool")
+  startTime      DateTime       @map("start_time")
+  createdAt      DateTime       @default(now()) @map("created_at")
+
+  participants   RoomParticipant[]
+
+  @@map("rooms")
+}
+
+model Category {
+  id        String     @id @default(uuid())
+  name      String     @unique
+  isActive  Boolean    @default(true) @map("is_active")
+  
+  questions Question[]
+
+  @@map("categories")
+}
+
+model Question {
+  id            String   @id @default(uuid())
+  categoryId    String   @map("category_id")
+  text          String
+  correctAnswer String   @map("correct_answer")
+  options       Json
+  difficulty    Int      @default(1)
+  
+  category      Category @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+
+  @@map("questions")
+}
+
+model RoomParticipant {
+  roomId                String  @map("room_id")
+  userId                String  @map("user_id")
+  score                 Int     @default(0)
+  hasPurchasedExtraLife Boolean @default(false) @map("has_purchased_extra_life")
+  isEliminated          Boolean @default(false) @map("is_eliminated")
+
+  room                  Room    @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  user                  User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([roomId, userId])
+  @@map("room_participants")
+}
+
+model SystemConfig {
+  id                 String  @id @default(uuid())
+  minAppVersion      String  @map("min_app_version")
+  latestAppVersion   String  @map("latest_app_version")
+  maintenanceMode    Boolean @default(false) @map("maintenance_mode")
+  maintenanceMessage String? @map("maintenance_message")
+
+  @@map("system_configs")
 }
