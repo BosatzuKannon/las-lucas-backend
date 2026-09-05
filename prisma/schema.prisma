@@ -51,6 +51,8 @@ model User {
   avatarUrl              String?         @map("avatar_url")
   status                 UserStatus      @default(ACTIVE)
   balanceLucas           Float           @default(0) @map("balance_lucas")
+  isPro                  Boolean         @default(false) @map("is_pro")
+  isVerified             Boolean         @default(false) @map("is_verified")
   phone                  String?
   identificationDocument String?         @map("identification_document")
   createdAt              DateTime        @default(now()) @map("created_at")
@@ -113,6 +115,12 @@ model Room {
   extraLifeFee   Float          @map("extra_life_fee")
   prizePool      Float          @map("prize_pool")
   startTime      DateTime       @map("start_time")
+  maxPlayers               Int            @map("max_players")
+  currentPlayers           Int            @default(0) @map("current_players")
+  normalQuestionCount      Int            @map("normal_question_count")
+  normalQuestionDuration   Int            @default(7) @map("normal_question_duration")
+  survivalQuestionDuration Int            @default(4) @map("survival_question_duration")
+  
   createdAt      DateTime       @default(now()) @map("created_at")
 
   participants   RoomParticipant[]

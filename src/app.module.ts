@@ -6,6 +6,7 @@ import { AppService } from './app.service';
 import { PrismaModule } from './prisma/prisma.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { KeepAliveModule } from './modules/keep-alive/keep-alive.module';
+import { TournamentsModule } from './tournaments/tournaments.module';
 
 @Module({
   imports: [
@@ -14,6 +15,7 @@ import { KeepAliveModule } from './modules/keep-alive/keep-alive.module';
     PrismaModule,
     AuthModule,
     KeepAliveModule,
+    TournamentsModule,
   ],
   controllers: [AppController],
   providers: [AppService],
