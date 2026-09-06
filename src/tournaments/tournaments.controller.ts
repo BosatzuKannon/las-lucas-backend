@@ -21,6 +21,12 @@ export class TournamentsController {
     return this.tournamentsService.getWaitingRooms();
   }
 
+  @Get(':id/waiting-room')
+  @UseGuards(JwtAuthGuard)
+  getWaitingRoom(@Req() req: AuthenticatedRequest, @Param('id') roomId: string) {
+    return this.tournamentsService.getWaitingRoom(roomId);
+  }
+
   @Post(':id/join')
   @UseGuards(JwtAuthGuard)
   joinTournament(

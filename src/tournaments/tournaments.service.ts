@@ -23,6 +23,31 @@ export class TournamentsService {
   }
 
   /**
+   * Devuelve el estado de una sala en espera junto con sus participantes,
+   * exponiendo únicamente id, name y avatarUrl de cada usuario por seguridad.
+   */
+  async getWaitingRoom(roomId: string) {
+    const room = await this.prisma.room.findUnique({
+      where: { id: roomId },
+      include: {
+        participants: {
+          include: {
+            user: {
+              select: { id: true, name: true, avatarUrl: true },
+            },
+          },
+        },
+      },
+    });
+
+    if (!room) {
+      throw new NotFoundException('Sala de torneo no encontrada');
+    }
+
+    return room;
+  }
+
+  /**
    * Cron interno: cada 30s promueve a ACTIVE las salas en WAITING cuyo
    * startTime (timestamptz, instante UTC) ya fue alcanzado por la hora
    * actual de Colombia. La burbuja del servidor corre en America/Bogota
