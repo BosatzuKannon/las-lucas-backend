@@ -51,37 +51,43 @@ export class TournamentsService {
   async processRoomLifecycle() {
     const now = new Date();
 
+    const openingTime = new Date(now.getTime() + WAITING_WINDOW_MS);
+
     const { count: scheduledToWaiting } = await this.prisma.room.updateMany({
       where: {
         status: RoomStatus.SCHEDULED,
-        startTime: { lte: new Date(now.getTime() + WAITING_WINDOW_MS) },
+        startTime: { lte: openingTime },
       },
-      data: { status: RoomStatus.WAITING },
+      data: {
+        status: RoomStatus.WAITING,
+        startTime: openingTime,
+      },
     });
 
     if (scheduledToWaiting > 0) {
       this.logger.log(
-        `${scheduledToWaiting} sala(s) SCHEDULED → WAITING (${formatBogota(now)})`,
+        `${scheduledToWaiting} sala(s) abiertas → WAITING, ventana garantizada de 10 min desde ${formatBogota(
+          openingTime,
+        )}`,
       );
     }
 
-    const waitingExpired = await this.prisma.room.findMany({
-      where: {
-        status: RoomStatus.WAITING,
-        startTime: { lte: now },
-      },
+    const waitingRooms = await this.prisma.room.findMany({
+      where: { status: RoomStatus.WAITING },
     });
 
-    for (const room of waitingExpired) {
+    for (const room of waitingRooms) {
       if (room.currentPlayers >= room.maxPlayers) {
-        await this.prisma.room.update({
-          where: { id: room.id },
+        const { count } = await this.prisma.room.updateMany({
+          where: { id: room.id, status: RoomStatus.WAITING },
           data: { status: RoomStatus.ACTIVE },
         });
-        this.logger.log(
-          `Sala ${room.id} WAITING → ACTIVE (llena) (${formatBogota(now)})`,
-        );
-      } else {
+        if (count > 0) {
+          this.logger.log(
+            `Sala ${room.id} WAITING → ACTIVE (llena) (${formatBogota(now)})`,
+          );
+        }
+      } else if (room.startTime <= now) {
         await this.cancelAndRefund(room.id);
       }
     }
@@ -89,6 +95,15 @@ export class TournamentsService {
 
   async cancelAndRefund(roomId: string) {
     await this.prisma.$transaction(async (tx) => {
+      const raceGuard = await tx.room.updateMany({
+        where: { id: roomId, status: RoomStatus.WAITING },
+        data: { status: RoomStatus.CANCELLED },
+      });
+
+      if (raceGuard.count === 0) {
+        return;
+      }
+
       const participants = await tx.roomParticipant.findMany({
         where: { roomId },
         include: {
@@ -119,11 +134,6 @@ export class TournamentsService {
         });
       }
 
-      await tx.room.update({
-        where: { id: roomId },
-        data: { status: RoomStatus.CANCELLED },
-      });
-
       this.logger.log(
         `Sala ${roomId} WAITING → CANCELLED (${participants.length} reembolsos)`,
       );
@@ -140,12 +150,9 @@ export class TournamentsService {
         throw new NotFoundException('Sala de torneo no encontrada');
       }
 
-      if (
-        room.status !== RoomStatus.SCHEDULED &&
-        room.status !== RoomStatus.WAITING
-      ) {
+      if (room.status !== RoomStatus.WAITING) {
         throw new BadRequestException(
-          'La sala ya no acepta inscripciones en este momento',
+          'El torneo aún no ha iniciado. Espera a que se abra la sala de espera.',
         );
       }
 
@@ -203,13 +210,13 @@ export class TournamentsService {
         },
       });
 
-      const updatedRoom = await tx.room.update({
+      let updatedRoom = await tx.room.update({
         where: { id: roomId },
         data: { currentPlayers: { increment: 1 } },
       });
 
       if (updatedRoom.currentPlayers >= updatedRoom.maxPlayers) {
-        await tx.room.update({
+        updatedRoom = await tx.room.update({
           where: { id: roomId },
           data: { status: RoomStatus.ACTIVE },
         });

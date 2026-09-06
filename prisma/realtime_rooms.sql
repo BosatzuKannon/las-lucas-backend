@@ -32,3 +32,19 @@ CREATE POLICY "Participants are readable by everyone" ON public.room_participant
 DROP POLICY IF EXISTS "Users can read own profile" ON public.users;
 ALTER TABLE public.users ENABLE ROW LEVEL SECURITY;
 CREATE POLICY "Users can read own profile" ON public.users FOR SELECT USING (auth.uid()::text = id);
+
+-- 1. Restaurar el acceso al esquema público para las APIs de Supabase
+GRANT USAGE ON SCHEMA public TO postgres, anon, authenticated, service_role;
+
+-- 2. Restaurar privilegios sobre todas las tablas, funciones y secuencias
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO postgres, anon, authenticated, service_role;
+GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO postgres, anon, authenticated, service_role;
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO postgres, anon, authenticated, service_role;
+
+-- 3. Configurar permisos por defecto para futuras tablas
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO postgres, anon, authenticated, service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO postgres, anon, authenticated, service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO postgres, anon, authenticated, service_role;
+
+-- 4. Limpiar la caché de PostgREST para que reconozca los nuevos permisos inmediatamente
+NOTIFY pgrst, 'reload schema';
