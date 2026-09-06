@@ -1,0 +1,6 @@
+-- AlterEnum
+ALTER TYPE "RoomStatus" ADD VALUE 'SCHEDULED';
+ALTER TYPE "RoomStatus" ADD VALUE 'CANCELLED';
+
+-- AlterEnum
+ALTER TYPE "TransactionType" ADD VALUE 'REFUND';

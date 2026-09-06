@@ -21,6 +21,7 @@ enum TransactionType {
   ENTRY_FEE
   PRIZE
   LIFE_PURCHASE
+  REFUND
 }
 
 enum TransactionStatus {
@@ -37,9 +38,11 @@ enum TournamentType {
 }
 
 enum RoomStatus {
+  SCHEDULED
   WAITING
   ACTIVE
   FINISHED
+  CANCELLED
 }
 
 // --- MODELS ---
@@ -110,7 +113,7 @@ model Transaction {
 model Room {
   id             String         @id @default(uuid())
   tournamentType TournamentType @map("tournament_type")
-  status         RoomStatus     @default(WAITING)
+  status         RoomStatus     @default(SCHEDULED)
   entryFee       Float          @map("entry_fee")
   extraLifeFee   Float          @map("extra_life_fee")
   prizePool      Float          @map("prize_pool")

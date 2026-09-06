@@ -17,8 +17,8 @@ export class TournamentsController {
   constructor(private readonly tournamentsService: TournamentsService) {}
 
   @Get()
-  getWaitingRooms() {
-    return this.tournamentsService.getWaitingRooms();
+  getOpenRooms() {
+    return this.tournamentsService.getOpenRooms();
   }
 
   @Get(':id/waiting-room')
