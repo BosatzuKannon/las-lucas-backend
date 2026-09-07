@@ -7,6 +7,7 @@ import { PrismaModule } from './prisma/prisma.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { KeepAliveModule } from './modules/keep-alive/keep-alive.module';
 import { TournamentsModule } from './tournaments/tournaments.module';
+import { CategoriesModule } from './categories/categories.module';
 
 @Module({
   imports: [
@@ -16,6 +17,7 @@ import { TournamentsModule } from './tournaments/tournaments.module';
     AuthModule,
     KeepAliveModule,
     TournamentsModule,
+    CategoriesModule,
   ],
   controllers: [AppController],
   providers: [AppService],

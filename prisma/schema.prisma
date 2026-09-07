@@ -40,6 +40,7 @@ enum TournamentType {
 enum RoomStatus {
   SCHEDULED
   WAITING
+  VOTING
   ACTIVE
   FINISHED
   CANCELLED
@@ -114,6 +115,7 @@ model Room {
   id             String         @id @default(uuid())
   tournamentType TournamentType @map("tournament_type")
   status         RoomStatus     @default(SCHEDULED)
+  selectedCategoryId String?    @map("selected_category_id")
   entryFee       Float          @map("entry_fee")
   extraLifeFee   Float          @map("extra_life_fee")
   prizePool      Float          @map("prize_pool")
@@ -160,6 +162,10 @@ model RoomParticipant {
   score                 Int     @default(0)
   hasPurchasedExtraLife Boolean @default(false) @map("has_purchased_extra_life")
   isEliminated          Boolean @default(false) @map("is_eliminated")
+
+  // Votación de categoría en vivo (fase VOTING).
+  votedCategoryId String?   @map("voted_category_id")
+  votedAt         DateTime? @map("voted_at")
 
   // Snapshot de presentación tomado al momento de la inscripción.
   // Permite que el canal Realtime de room_participants sea autosuficiente

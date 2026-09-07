@@ -10,6 +10,7 @@ import {
 import { JwtAuthGuard } from '../modules/auth/jwt-auth.guard';
 import type { AuthenticatedRequest } from '../modules/auth/jwt-auth.guard';
 import { JoinTournamentDto } from './dto/join-tournament.dto';
+import { VoteDto } from './dto/vote.dto';
 import { TournamentsService } from './tournaments.service';
 
 @Controller('tournaments')
@@ -40,4 +41,19 @@ export class TournamentsController {
       dto.buyExtraLife ?? false,
     );
   }
+
+  @Post(':id/vote')
+  @UseGuards(JwtAuthGuard)
+  voteForRoom(
+    @Req() req: AuthenticatedRequest,
+    @Param('id') roomId: string,
+    @Body() dto: VoteDto,
+  ) {
+    return this.tournamentsService.voteForRoom(
+      req.user.sub,
+      roomId,
+      dto.categoryId,
+    );
+  }
 }
+
