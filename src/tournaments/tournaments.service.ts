@@ -207,6 +207,8 @@ export class TournamentsService {
           roomId,
           userId,
           hasPurchasedExtraLife: buyExtraLife,
+          userName: user.name,
+          userAvatarUrl: user.avatarUrl,
         },
       });
 

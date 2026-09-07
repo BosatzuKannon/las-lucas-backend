@@ -161,6 +161,12 @@ model RoomParticipant {
   hasPurchasedExtraLife Boolean @default(false) @map("has_purchased_extra_life")
   isEliminated          Boolean @default(false) @map("is_eliminated")
 
+  // Snapshot de presentación tomado al momento de la inscripción.
+  // Permite que el canal Realtime de room_participants sea autosuficiente
+  // (el cliente no necesita re-consultar el backend para renderizar el chip).
+  userName      String  @map("user_name")
+  userAvatarUrl String? @map("user_avatar_url")
+
   room                  Room    @relation(fields: [roomId], references: [id], onDelete: Cascade)
   user                  User    @relation(fields: [userId], references: [id], onDelete: Cascade)
 
