@@ -24,7 +24,10 @@ export class TournamentsController {
 
   @Get(':id/waiting-room')
   @UseGuards(JwtAuthGuard)
-  getWaitingRoom(@Req() req: AuthenticatedRequest, @Param('id') roomId: string) {
+  getWaitingRoom(
+    @Req() req: AuthenticatedRequest,
+    @Param('id') roomId: string,
+  ) {
     return this.tournamentsService.getWaitingRoom(roomId);
   }
 
@@ -56,4 +59,3 @@ export class TournamentsController {
     );
   }
 }
-

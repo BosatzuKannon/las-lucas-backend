@@ -7,6 +7,7 @@ import {
 import { Interval } from '@nestjs/schedule';
 import { RoomStatus, TransactionStatus, TransactionType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { GameplayGateway } from '../modules/gameplay/gameplay.gateway';
 import { DEFAULT_TIMEZONE } from '../config/timezone';
 
 /** Ventana de espera de la sala de espera (10 minutos). */
@@ -19,7 +20,10 @@ const VOTING_WINDOW_MS = 45 * 1000;
 export class TournamentsService {
   private readonly logger = new Logger(TournamentsService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly gameplayGateway: GameplayGateway,
+  ) {}
 
   // -----------------------------------------------------------------------
   // Lecturas
@@ -167,7 +171,9 @@ export class TournamentsService {
     }
 
     if (room.status !== RoomStatus.VOTING) {
-      throw new BadRequestException('La votación de categorías no está abierta para esta sala');
+      throw new BadRequestException(
+        'La votación de categorías no está abierta para esta sala',
+      );
     }
 
     const category = await this.prisma.category.findUnique({
@@ -319,7 +325,9 @@ export class TournamentsService {
 
         if (activeCategories.length > 0) {
           selectedCategoryId =
-            activeCategories[Math.floor(Math.random() * activeCategories.length)].id;
+            activeCategories[
+              Math.floor(Math.random() * activeCategories.length)
+            ].id;
         } else {
           // Fallback: cualquier categoría.
           const anyCategory = await this.prisma.category.findFirst({
@@ -386,6 +394,12 @@ export class TournamentsService {
         this.logger.log(
           `Sala ${room.id} VOTING → ACTIVE (categoría: ${selectedCategoryId ?? 'N/A'})`,
         );
+
+        const started = await this.gameplayGateway.startQuestion(room.id);
+
+        if (!started) {
+          await this.gameplayGateway.finishGame(room.id, 0);
+        }
       }
     }
   }

@@ -6,6 +6,7 @@ import { AppService } from './app.service';
 import { PrismaModule } from './prisma/prisma.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { KeepAliveModule } from './modules/keep-alive/keep-alive.module';
+import { GameplayModule } from './modules/gameplay/gameplay.module';
 import { TournamentsModule } from './tournaments/tournaments.module';
 import { CategoriesModule } from './categories/categories.module';
 
@@ -16,6 +17,7 @@ import { CategoriesModule } from './categories/categories.module';
     PrismaModule,
     AuthModule,
     KeepAliveModule,
+    GameplayModule,
     TournamentsModule,
     CategoriesModule,
   ],
