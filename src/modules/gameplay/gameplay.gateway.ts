@@ -44,6 +44,9 @@ export class GameplayGateway
   private readonly finishTimers = new Map<string, NodeJS.Timeout>();
   private readonly nextQuestionTimers = new Map<string, NodeJS.Timeout>();
 
+  /** Salas en ventana de inicio (`roomId` → timestamp de la 1ª pregunta). */
+  private readonly startingGames = new Map<string, number>();
+
   @WebSocketServer()
   server!: Server;
 
@@ -93,6 +96,7 @@ export class GameplayGateway
         ok: true,
         roomId: dto.roomId,
         activeQuestion: this.gameplayService.getActiveQuestion(dto.roomId),
+        gameStarting: this.getGameStarting(dto.roomId),
       },
     };
   }
@@ -117,6 +121,9 @@ export class GameplayGateway
     roomId: string,
     questionId?: string,
   ): Promise<QuestionStartedPayload | null> {
+    // Terminó la ventana de inicio: deja de reportarla en el ack de join_room.
+    this.startingGames.delete(roomId);
+
     const started = await this.gameplayService.startQuestion(
       roomId,
       questionId,
@@ -131,7 +138,39 @@ export class GameplayGateway
     return started.payload;
   }
 
+  /**
+   * Activa la ventana de inicio de la partida: anuncia a la sala y registra el
+   * `startTime` (instante en que arranca la primera pregunta) para que los
+   * clientes que conecten durante este lapso lo reciban vía el ack de
+   * `join_room` y puedan mostrar su contador 5, 4, 3, 2, 1.
+   */
+  startGameCountdown(roomId: string, startTime: number): void {
+    this.startingGames.set(roomId, startTime);
+    this.server.to(roomId).emit('game_starting', { startTime });
+
+    this.logger.log(
+      `Sala ${roomId} en ventana de inicio (#1 pregunta a las ${startTime})`,
+    );
+  }
+
+  /**
+   * Devuelve el estado de inicio activo de una sala, o `null` si su ventana
+   * ya venció (o nunca existió). Limpia la entrada vencida del mapa.
+   */
+  private getGameStarting(roomId: string): { startTime: number } | null {
+    const startTime = this.startingGames.get(roomId);
+
+    if (startTime === undefined || startTime <= Date.now()) {
+      this.startingGames.delete(roomId);
+      return null;
+    }
+
+    return { startTime };
+  }
+
   async finishGame(roomId: string, survivors: number): Promise<void> {
+    this.startingGames.delete(roomId);
+
     const finished = await this.gameplayService.finishRoom(roomId);
 
     if (!finished) {
@@ -156,6 +195,7 @@ export class GameplayGateway
 
     this.finishTimers.clear();
     this.nextQuestionTimers.clear();
+    this.startingGames.clear();
   }
 
   private scheduleFinish(

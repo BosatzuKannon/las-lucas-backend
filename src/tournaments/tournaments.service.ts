@@ -16,6 +16,18 @@ const WAITING_WINDOW_MS = 10 * 60 * 1000;
 /** Duración de la fase de votación de categoría (45 segundos). */
 const VOTING_WINDOW_MS = 45 * 1000;
 
+/**
+ * Buffer de conexión al pasar una sala a ACTIVE: tiempo que se espera antes de
+ * disparar la primera pregunta para que los clientes React Native terminen de
+ * montar GameplayScreen y conecten su WebSocket al namespace `/gameplay`.
+ */
+const GAME_START_CONNECTION_BUFFER_MS = 5_000;
+
+/** Pausa asíncrona que no bloquea el event loop. */
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 @Injectable()
 export class TournamentsService {
   private readonly logger = new Logger(TournamentsService.name);
@@ -394,6 +406,13 @@ export class TournamentsService {
         this.logger.log(
           `Sala ${room.id} VOTING → ACTIVE (categoría: ${selectedCategoryId ?? 'N/A'})`,
         );
+
+        // Buffer de conexión: da tiempo a los clientes para montar la pantalla
+        // y conectar su WebSocket antes de la primera pregunta. La sala ya está
+        // en ACTIVE, así que el cron no la vuelve a procesar durante la espera.
+        const startTime = Date.now() + GAME_START_CONNECTION_BUFFER_MS;
+        this.gameplayGateway.startGameCountdown(room.id, startTime);
+        await delay(GAME_START_CONNECTION_BUFFER_MS);
 
         const started = await this.gameplayGateway.startQuestion(room.id);
 
