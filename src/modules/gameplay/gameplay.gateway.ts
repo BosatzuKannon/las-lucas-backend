@@ -1,4 +1,4 @@
-import { Logger, OnModuleDestroy } from '@nestjs/common';
+import { Logger, OnModuleDestroy, UseFilters } from '@nestjs/common';
 import {
   ConnectedSocket,
   MessageBody,
@@ -20,11 +20,22 @@ import {
 import { JoinRoomDto } from './dto/join-room.dto';
 import { SubmitAnswerDto } from './dto/submit-answer.dto';
 import { SocketAuthService } from './socket-auth.service';
+import { WsGameplayExceptionsFilter } from './ws-exceptions.filter';
 
 export interface GameplaySocketData {
   user?: AuthUser;
   roomId?: string;
 }
+
+export interface JoinRoomAckData {
+  ok: boolean;
+  roomId: string;
+  reason?: 'NOT_AUTHENTICATED' | 'NOT_PARTICIPANT' | 'SERVER_ERROR';
+  activeQuestion: QuestionStartedPayload | null;
+  gameStarting: { startTime: number } | null;
+}
+
+type JoinRoomAck = { event: 'join_room'; data: JoinRoomAckData };
 
 type GameplaySocket = Socket<
   DefaultEventsMap,
@@ -37,6 +48,7 @@ type GameplaySocket = Socket<
   namespace: '/gameplay',
   cors: true,
 })
+@UseFilters(WsGameplayExceptionsFilter)
 export class GameplayGateway
   implements OnGatewayConnection, OnGatewayDisconnect, OnModuleDestroy
 {
@@ -64,17 +76,27 @@ export class GameplayGateway
       return;
     }
 
-    const user = await this.socketAuth.verifyToken(token);
+    try {
+      const user = await this.socketAuth.verifyToken(token);
 
-    if (!user || !user.sub) {
-      this.logger.warn(
-        'Conexión rechazada al namespace /gameplay: token JWT inválido o expirado.',
+      if (!user || !user.sub) {
+        this.logger.warn(
+          'Conexión rechazada al namespace /gameplay: token JWT inválido o expirado.',
+        );
+        client.disconnect(true);
+        return;
+      }
+
+      client.data.user = { sub: user.sub, email: user.email };
+    } catch (error) {
+      this.logger.error(
+        `Error al autenticar conexión al namespace /gameplay: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        error instanceof Error ? error.stack : undefined,
       );
       client.disconnect(true);
-      return;
     }
-
-    client.data.user = { sub: user.sub, email: user.email };
   }
 
   handleDisconnect(client: GameplaySocket): void {
@@ -85,47 +107,65 @@ export class GameplayGateway
   async joinRoom(
     @ConnectedSocket() client: GameplaySocket,
     @MessageBody() dto: JoinRoomDto,
-  ) {
+  ): Promise<JoinRoomAck> {
     const user = client.data.user;
 
     if (!user) {
-      // Defensa: nunca lanzar una excepción no controlada (cerraría el socket
-      // sin que el cliente reciba un ack). Se devuelve un ack de rechazo
-      // explícito para que el frontend muestre el error de inmediato.
+      // Defensa: nunca lanzar una excepción no controlada (dejaría al cliente
+      // sin ack hasta su timeout). Se devuelve un ack de rechazo explícito.
+      return this.rejectJoinRoom(dto.roomId, 'NOT_AUTHENTICATED');
+    }
+
+    try {
+      const isParticipant = await this.gameplayService.isParticipant(
+        dto.roomId,
+        user.sub,
+        user.email,
+      );
+
+      if (!isParticipant) {
+        this.logger.warn(
+          `[join_room] ${user.sub} no es participante de la sala ${dto.roomId}`,
+        );
+        client.emit('error', { message: 'No eres participante de esta sala' });
+        return this.rejectJoinRoom(dto.roomId, 'NOT_PARTICIPANT');
+      }
+
+      await client.join(dto.roomId);
+      client.data.roomId = dto.roomId;
+
       return {
         event: 'join_room',
         data: {
-          ok: false,
+          ok: true,
           roomId: dto.roomId,
-          activeQuestion: null,
-          gameStarting: null,
+          activeQuestion: this.gameplayService.getActiveQuestion(dto.roomId),
+          gameStarting: this.getGameStarting(dto.roomId),
         },
       };
+    } catch (error) {
+      this.logger.error(
+        `[join_room] Error al procesar ${user.sub} en sala ${dto.roomId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        error instanceof Error ? error.stack : undefined,
+      );
+      return this.rejectJoinRoom(dto.roomId, 'SERVER_ERROR');
     }
+  }
 
-    if (!(await this.gameplayService.isParticipant(dto.roomId, user.sub))) {
-      client.emit('error', { message: 'No eres participante de esta sala' });
-      return {
-        event: 'join_room',
-        data: {
-          ok: false,
-          roomId: dto.roomId,
-          activeQuestion: null,
-          gameStarting: null,
-        },
-      };
-    }
-
-    await client.join(dto.roomId);
-    client.data.roomId = dto.roomId;
-
+  private rejectJoinRoom(
+    roomId: string,
+    reason: NonNullable<JoinRoomAckData['reason']>,
+  ): JoinRoomAck {
     return {
       event: 'join_room',
       data: {
-        ok: true,
-        roomId: dto.roomId,
-        activeQuestion: this.gameplayService.getActiveQuestion(dto.roomId),
-        gameStarting: this.getGameStarting(dto.roomId),
+        ok: false,
+        roomId,
+        reason,
+        activeQuestion: null,
+        gameStarting: null,
       },
     };
   }

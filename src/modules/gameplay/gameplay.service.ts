@@ -244,12 +244,44 @@ export class GameplayService {
     };
   }
 
-  async isParticipant(roomId: string, userId: string): Promise<boolean> {
+  async isParticipant(
+    roomId: string,
+    userId: string,
+    email?: string,
+  ): Promise<boolean> {
+    const userIds = await this.resolveParticipantUserIds(userId, email);
+
     const count = await this.prisma.roomParticipant.count({
-      where: { roomId, userId },
+      where: { roomId, userId: { in: userIds } },
     });
 
     return count > 0;
+  }
+
+  /**
+   * El `sub` del JWT de Supabase puede diferir del `id` de Prisma del usuario
+   * según el flujo con el que se registró la cuenta. Resuelve ambos
+   * identificadores para que la validación de participación no dependa de la
+   * convención de IDs de un flujo concreto.
+   */
+  private async resolveParticipantUserIds(
+    userId: string,
+    email?: string,
+  ): Promise<string[]> {
+    const ids = new Set<string>([userId]);
+
+    if (email) {
+      const user = await this.prisma.user.findUnique({
+        where: { email },
+        select: { id: true },
+      });
+
+      if (user) {
+        ids.add(user.id);
+      }
+    }
+
+    return [...ids];
   }
 
   disposeRoom(roomId: string): void {
