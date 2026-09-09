@@ -43,6 +43,7 @@ export interface QuestionResultsPayload {
 }
 
 export type SubmitAnswerRejection =
+  | 'NOT_AUTHENTICATED'
   | 'NO_ACTIVE_QUESTION'
   | 'QUESTION_NOT_ACTIVE'
   | 'NOT_PARTICIPANT'

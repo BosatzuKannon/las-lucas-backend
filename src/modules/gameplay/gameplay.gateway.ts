@@ -1,5 +1,4 @@
 import { Logger, OnModuleDestroy } from '@nestjs/common';
-import { JwtService } from '@nestjs/jwt';
 import {
   ConnectedSocket,
   MessageBody,
@@ -20,6 +19,7 @@ import {
 } from './gameplay.service';
 import { JoinRoomDto } from './dto/join-room.dto';
 import { SubmitAnswerDto } from './dto/submit-answer.dto';
+import { SocketAuthService } from './socket-auth.service';
 
 export interface GameplaySocketData {
   user?: AuthUser;
@@ -52,23 +52,29 @@ export class GameplayGateway
 
   constructor(
     private readonly gameplayService: GameplayService,
-    private readonly jwtService: JwtService,
+    private readonly socketAuth: SocketAuthService,
   ) {}
 
-  handleConnection(client: GameplaySocket): void {
+  async handleConnection(client: GameplaySocket): Promise<void> {
     const token = this.extractToken(client);
 
     if (!token) {
+      this.logger.warn('Conexión rechazada al namespace /gameplay: sin token.');
       client.disconnect(true);
       return;
     }
 
-    try {
-      const claims = this.jwtService.verify<AuthUser>(token);
-      client.data.user = { sub: claims.sub, email: claims.email };
-    } catch {
+    const user = await this.socketAuth.verifyToken(token);
+
+    if (!user || !user.sub) {
+      this.logger.warn(
+        'Conexión rechazada al namespace /gameplay: token JWT inválido o expirado.',
+      );
       client.disconnect(true);
+      return;
     }
+
+    client.data.user = { sub: user.sub, email: user.email };
   }
 
   handleDisconnect(client: GameplaySocket): void {
@@ -80,11 +86,34 @@ export class GameplayGateway
     @ConnectedSocket() client: GameplaySocket,
     @MessageBody() dto: JoinRoomDto,
   ) {
-    const user = client.data.user!;
+    const user = client.data.user;
+
+    if (!user) {
+      // Defensa: nunca lanzar una excepción no controlada (cerraría el socket
+      // sin que el cliente reciba un ack). Se devuelve un ack de rechazo
+      // explícito para que el frontend muestre el error de inmediato.
+      return {
+        event: 'join_room',
+        data: {
+          ok: false,
+          roomId: dto.roomId,
+          activeQuestion: null,
+          gameStarting: null,
+        },
+      };
+    }
 
     if (!(await this.gameplayService.isParticipant(dto.roomId, user.sub))) {
       client.emit('error', { message: 'No eres participante de esta sala' });
-      return;
+      return {
+        event: 'join_room',
+        data: {
+          ok: false,
+          roomId: dto.roomId,
+          activeQuestion: null,
+          gameStarting: null,
+        },
+      };
     }
 
     await client.join(dto.roomId);
@@ -106,7 +135,15 @@ export class GameplayGateway
     @ConnectedSocket() client: GameplaySocket,
     @MessageBody() dto: SubmitAnswerDto,
   ): { event: 'submit_answer'; data: SubmitAnswerResult } {
-    const user = client.data.user!;
+    const user = client.data.user;
+
+    if (!user) {
+      return {
+        event: 'submit_answer',
+        data: { accepted: false, reason: 'NOT_AUTHENTICATED' },
+      };
+    }
+
     const result = this.gameplayService.submitAnswer(
       dto.roomId,
       dto.questionId,
