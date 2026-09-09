@@ -245,20 +245,46 @@ export class GameplayGateway
     return { startTime };
   }
 
-  async finishGame(roomId: string, survivors: number): Promise<void> {
+  /**
+   * Cierra la sala: liquida ganadores (transacción idempotente) y emite
+   * `game_finished` con el estado final real (ganador/es, posiciones, premios)
+   * para que el frontend no use datos genéricos. Si la sala ya fue liquidada
+   * (doble disparo, reinicio), no re-paga ni re-emite.
+   */
+  async finishGame(
+    roomId: string,
+    winnerIds: string[],
+    survivors: number,
+  ): Promise<void> {
     this.startingGames.delete(roomId);
 
-    const finished = await this.gameplayService.finishRoom(roomId);
+    const settlement = await this.gameplayService.settleRoom(
+      roomId,
+      winnerIds,
+      survivors,
+    );
 
-    if (!finished) {
+    if (!settlement) {
       return;
     }
 
-    this.server.to(roomId).emit('game_finished', { roomId, survivors });
+    this.server.to(roomId).emit('game_finished', {
+      roomId,
+      prizePool: settlement.prizePool,
+      survivors,
+      winners: settlement.winners,
+      participants: settlement.participants,
+    });
 
     this.logger.log(
-      `Sala ${roomId} terminada con ${survivors} superviviente(s)`,
+      `Sala ${roomId} terminada con ${survivors} superviviente(s); liquidados ${settlement.winners.length} ganador(es)`,
     );
+  }
+
+  /** Variante para salas sin pregunta activa: ganan quienes siguen vivos. */
+  async finishGameWithAlive(roomId: string): Promise<void> {
+    const winnerIds = await this.gameplayService.getAliveParticipantIds(roomId);
+    await this.finishGame(roomId, winnerIds, winnerIds.length);
   }
 
   onModuleDestroy(): void {
@@ -315,7 +341,9 @@ export class GameplayGateway
     );
 
     if (results.survivors === 0) {
-      await this.finishGame(roomId, 0);
+      // Muerte súbita total: todos los que llegaron vivos a la pregunta N
+      // comparten el pozo en partes iguales (Excepción 1).
+      await this.finishGame(roomId, results.aliveAtStartUserIds, 0);
       return;
     }
 
@@ -334,7 +362,9 @@ export class GameplayGateway
     const started = await this.gameplayService.startQuestion(roomId);
 
     if (!started) {
-      await this.finishGame(roomId, lastSurvivors);
+      const winnerIds =
+        await this.gameplayService.getAliveParticipantIds(roomId);
+      await this.finishGame(roomId, winnerIds, lastSurvivors);
       return;
     }
 

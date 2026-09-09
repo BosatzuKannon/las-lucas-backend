@@ -417,7 +417,7 @@ export class TournamentsService {
         const started = await this.gameplayGateway.startQuestion(room.id);
 
         if (!started) {
-          await this.gameplayGateway.finishGame(room.id, 0);
+          await this.gameplayGateway.finishGameWithAlive(room.id);
         }
       }
     }

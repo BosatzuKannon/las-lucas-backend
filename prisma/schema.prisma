@@ -163,6 +163,16 @@ model RoomParticipant {
   hasPurchasedExtraLife Boolean @default(false) @map("has_purchased_extra_life")
   isEliminated          Boolean @default(false) @map("is_eliminated")
 
+  // Resultado final de la sala (se rellena únicamente en la liquidación).
+  // `position` usa ranking de competición (empates comparten posición): todos
+  // los ganadores son posición 1. Permanece null mientras la sala no se liquida.
+  position              Int?    @map("position")
+  // Porción del pozo ganada en esta sala. 0 para los no premiados.
+  prizeWon              Float   @default(0) @map("prize_won")
+  // Ronda (1-based) en la que el jugador fue eliminado. Permite reconstruir
+  // las posiciones tras un reinicio del servidor. null si nunca fue eliminado.
+  eliminatedAtQuestion  Int?    @map("eliminated_at_question")
+
   // Votación de categoría en vivo (fase VOTING).
   votedCategoryId String?   @map("voted_category_id")
   votedAt         DateTime? @map("voted_at")

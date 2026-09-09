@@ -1,5 +1,10 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { Question, RoomStatus } from '@prisma/client';
+import {
+  Question,
+  RoomStatus,
+  TransactionStatus,
+  TransactionType,
+} from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 
 export const LATENCY_MARGIN_MS = 500;
@@ -37,6 +42,9 @@ export interface QuestionResultsPayload {
   correctAnswer: string;
   correctCount: number;
   aliveAtStart: number;
+  /** userIds de los jugadores que llegaron vivos a esta pregunta (clave para
+   * la muerte súbita total: el pozo se reparte entre ellos). */
+  aliveAtStartUserIds: string[];
   survivors: number;
   eliminatedUserIds: string[];
   usedExtraLifeUserIds: string[];
@@ -52,6 +60,25 @@ export type SubmitAnswerRejection =
 
 export type SubmitAnswerResult =
   { accepted: true } | { accepted: false; reason: SubmitAnswerRejection };
+
+/** Estado final de un participante al liquidar la sala. */
+export interface FinalStanding {
+  userId: string;
+  name: string;
+  avatarUrl: string | null;
+  position: number;
+  prizeWon: number;
+  isEliminated: boolean;
+}
+
+/** Resultado completo de la liquidación de una sala. */
+export interface SettlementResult {
+  roomId: string;
+  prizePool: number;
+  survivors: number;
+  winners: FinalStanding[];
+  participants: FinalStanding[];
+}
 
 @Injectable()
 export class GameplayService {
@@ -173,6 +200,12 @@ export class GameplayService {
       return null;
     }
 
+    // Conjunto "llegados vivos a esta pregunta": se captura ANTES de borrar el
+    // estado (Excepción 1 → muerte súbita total).
+    const aliveAtStartUserIds = [...state.extraLifeByUser.keys()];
+    // Número (1-based) de la pregunta que acaba de cerrar.
+    const questionIndex = this.questionCursor.get(roomId) ?? 0;
+
     this.activeQuestions.delete(roomId);
 
     const eliminatedUserIds: string[] = [];
@@ -198,7 +231,7 @@ export class GameplayService {
       if (eliminatedUserIds.length > 0) {
         await tx.roomParticipant.updateMany({
           where: { roomId, userId: { in: eliminatedUserIds } },
-          data: { isEliminated: true },
+          data: { isEliminated: true, eliminatedAtQuestion: questionIndex },
         });
       }
 
@@ -223,6 +256,7 @@ export class GameplayService {
       correctAnswer: state.correctAnswer,
       correctCount,
       aliveAtStart: state.extraLifeByUser.size,
+      aliveAtStartUserIds,
       survivors,
       eliminatedUserIds,
       usedExtraLifeUserIds,
@@ -284,20 +318,197 @@ export class GameplayService {
     return [...ids];
   }
 
+  async getAliveParticipantIds(roomId: string): Promise<string[]> {
+    const rows = await this.prisma.roomParticipant.findMany({
+      where: { roomId, isEliminated: false },
+      select: { userId: true },
+    });
+
+    return rows.map((r) => r.userId);
+  }
+
+  /**
+   * Liquida la sala de forma atómica (Excepción 3):
+   *  1. Claim de idempotencia ACTIVE→FINISHED; si otra ejecución ya liquidó,
+   *     count === 0 → no se paga nada (nunca dos veces, ni tras reinicio).
+   *  2. Abona balanceLucas de los ganadores.
+   *  3. Crea una Transaction PRIZE/COMPLETED por ganador con reference única
+   *     por usuario + skipDuplicates (candado extra anti duplicados).
+   *  4. Persiste position + prizeWon de TODOS los participantes.
+   * Las posiciones y montos se calculan ANTES, en memoria (`buildSettlement`).
+   */
+  async settleRoom(
+    roomId: string,
+    winnerIds: string[],
+    survivors: number,
+  ): Promise<SettlementResult | null> {
+    const spec = await this.buildSettlement(roomId, winnerIds, survivors);
+
+    if (!spec) {
+      return null;
+    }
+
+    const settled = await this.prisma.$transaction(async (tx) => {
+      const claimed = await tx.room.updateMany({
+        where: { id: roomId, status: RoomStatus.ACTIVE },
+        data: { status: RoomStatus.FINISHED },
+      });
+
+      if (claimed.count === 0) {
+        return null;
+      }
+
+      if (spec.winners.length > 0) {
+        await tx.transaction.createMany({
+          data: spec.winners.map((w) => ({
+            userId: w.userId,
+            amount: w.prizeWon,
+            transactionType: TransactionType.PRIZE,
+            status: TransactionStatus.COMPLETED,
+            reference: `prize:${roomId}:${w.userId}`,
+          })),
+          skipDuplicates: true,
+        });
+
+        for (const winner of spec.winners) {
+          await tx.user.updateMany({
+            where: { id: winner.userId },
+            data: { balanceLucas: { increment: winner.prizeWon } },
+          });
+        }
+      }
+
+      for (const p of spec.participants) {
+        await tx.roomParticipant.update({
+          where: { roomId_userId: { roomId, userId: p.userId } },
+          data: { position: p.position, prizeWon: p.prizeWon },
+        });
+      }
+
+      return spec;
+    });
+
+    if (settled) {
+      this.disposeRoom(roomId);
+      this.logger.log(
+        `Sala ${roomId} liquidada: ${settled.winners.length} ganador(es), pozo ${settled.prizePool}, ${settled.survivors} superviviente(s)`,
+      );
+    }
+
+    return settled;
+  }
+
+  /**
+   * Construye EN MEMORIA el estado final completo (ganadores, montos exactos,
+   * posiciones de competición) a partir de la BD. No escribe nada.
+   *
+   * Reparto del pozo: centavos exactos; el remanente (0..0.99) se asigna al
+   * primer ganador en orden determinista para que Σ premios == prizePool.
+   * Posiciones: ranking de competición → position = 1 + nº de jugadores con
+   * supervivencia estrictamente mayor (los ganadores empatan en la posición 1).
+   */
+  private async buildSettlement(
+    roomId: string,
+    winnerIds: string[],
+    survivors: number,
+  ): Promise<SettlementResult | null> {
+    const room = await this.prisma.room.findUnique({ where: { id: roomId } });
+
+    if (!room || room.status !== RoomStatus.ACTIVE) {
+      return null;
+    }
+
+    const participants = await this.prisma.roomParticipant.findMany({
+      where: { roomId },
+      select: {
+        userId: true,
+        isEliminated: true,
+        eliminatedAtQuestion: true,
+        userName: true,
+        userAvatarUrl: true,
+      },
+    });
+
+    if (participants.length === 0) {
+      return null;
+    }
+
+    const winnerSet = new Set(winnerIds);
+
+    const eliminatedRanks = participants
+      .filter((p) => p.isEliminated)
+      .map((p) => p.eliminatedAtQuestion ?? 0);
+    const maxEliminatedRank =
+      eliminatedRanks.length > 0 ? Math.max(...eliminatedRanks) : 0;
+
+    // Ranking de supervivencia: los ganadores quedan estrictamente por encima
+    // de cualquier eliminado (sobreviven "una ronda más" que el último caído).
+    const ranked = participants.map((p) => {
+      const isWinner = winnerSet.has(p.userId);
+
+      return {
+        participant: p,
+        isWinner,
+        rank: isWinner ? maxEliminatedRank + 1 : (p.eliminatedAtQuestion ?? 0),
+      };
+    });
+
+    const sortedWinners = ranked
+      .filter((r) => r.isWinner)
+      .map((r) => r.participant.userId)
+      .sort();
+
+    const prizePool = room.prizePool;
+    const winnerCount = sortedWinners.length;
+    const baseAward =
+      winnerCount > 0 ? Math.floor((prizePool / winnerCount) * 100) / 100 : 0;
+    const distributed = baseAward * winnerCount;
+    const remainder = Math.max(
+      0,
+      Math.round((prizePool - distributed) * 100) / 100,
+    );
+
+    const prizes = new Map<string, number>();
+    for (const userId of sortedWinners) {
+      prizes.set(userId, baseAward);
+    }
+    if (sortedWinners.length > 0) {
+      const first = sortedWinners[0];
+      prizes.set(
+        first,
+        Math.round((prizes.get(first)! + remainder) * 100) / 100,
+      );
+    }
+
+    const participantsList = ranked.map(({ participant: p, rank }) => {
+      const position = 1 + ranked.filter((r) => r.rank > rank).length;
+
+      return {
+        userId: p.userId,
+        name: p.userName,
+        avatarUrl: p.userAvatarUrl,
+        position,
+        prizeWon: prizes.get(p.userId) ?? 0,
+        isEliminated: p.isEliminated,
+      };
+    });
+
+    const winners = participantsList
+      .filter((s) => prizes.has(s.userId))
+      .sort((a, b) => a.userId.localeCompare(b.userId));
+
+    return {
+      roomId,
+      prizePool,
+      survivors,
+      winners,
+      participants: participantsList,
+    };
+  }
+
   disposeRoom(roomId: string): void {
     this.activeQuestions.delete(roomId);
     this.questionCursor.delete(roomId);
-  }
-
-  async finishRoom(roomId: string): Promise<boolean> {
-    const { count } = await this.prisma.room.updateMany({
-      where: { id: roomId, status: RoomStatus.ACTIVE },
-      data: { status: RoomStatus.FINISHED },
-    });
-
-    this.disposeRoom(roomId);
-
-    return count > 0;
   }
 
   private async pickNextQuestion(
