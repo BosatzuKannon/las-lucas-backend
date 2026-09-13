@@ -11,6 +11,11 @@ import { JwtAuthGuard } from '../modules/auth/jwt-auth.guard';
 import type { AuthenticatedRequest } from '../modules/auth/jwt-auth.guard';
 import { JoinTournamentDto } from './dto/join-tournament.dto';
 import { VoteDto } from './dto/vote.dto';
+import type {
+  GetHistoryGlobalDto,
+  GetHistoryMeDto,
+  GetHistoryStatsDto,
+} from './dto/history.dto';
 import { TournamentsService } from './tournaments.service';
 
 @Controller('tournaments')
@@ -20,6 +25,28 @@ export class TournamentsController {
   @Get()
   getOpenRooms() {
     return this.tournamentsService.getOpenRooms();
+  }
+
+  // ---------- Historial (Fase 2: Ranking de Temporadas) ----------
+
+  @Get('history/stats')
+  @UseGuards(JwtAuthGuard)
+  getHistoryStats(
+    @Req() req: AuthenticatedRequest,
+  ): Promise<GetHistoryStatsDto> {
+    return this.tournamentsService.getHistoryStats(req.user.sub);
+  }
+
+  @Get('history/global')
+  @UseGuards(JwtAuthGuard)
+  getHistoryGlobal(): Promise<GetHistoryGlobalDto> {
+    return this.tournamentsService.getHistoryGlobal();
+  }
+
+  @Get('history/me')
+  @UseGuards(JwtAuthGuard)
+  getHistoryMe(@Req() req: AuthenticatedRequest): Promise<GetHistoryMeDto> {
+    return this.tournamentsService.getHistoryMe(req.user.sub);
   }
 
   @Get(':id/waiting-room')

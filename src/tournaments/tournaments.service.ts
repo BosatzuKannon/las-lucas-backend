@@ -5,10 +5,20 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { Interval } from '@nestjs/schedule';
-import { RoomStatus, TransactionStatus, TransactionType } from '@prisma/client';
+import {
+  RoomStatus,
+  TournamentType,
+  TransactionStatus,
+  TransactionType,
+} from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { GameplayGateway } from '../modules/gameplay/gameplay.gateway';
 import { DEFAULT_TIMEZONE } from '../config/timezone';
+import {
+  GetHistoryGlobalDto,
+  GetHistoryMeDto,
+  GetHistoryStatsDto,
+} from './dto/history.dto';
 
 /** Ventana de espera de la sala de espera (10 minutos). */
 const WAITING_WINDOW_MS = 10 * 60 * 1000;
@@ -20,6 +30,15 @@ const VOTING_WINDOW_MS = 45 * 1000;
  * dispara a los 5 s para que los clientes React Native terminen de montar
  * GameplayScreen y conecten su WebSocket al namespace `/gameplay`. */
 const GAME_START_CONNECTION_BUFFER_MS = 5_000;
+
+/** Umbrales de totalWon (Lucas acumuladas) para el nivel competitivo. */
+const TIER_BRONCE_MAX = 24_999;
+const TIER_PLATA_MAX = 99_999;
+const TIER_ORO_MAX = 299_999;
+const TIER_PLATINO_MAX = 999_999;
+
+/** Tope del historial global. */
+const HISTORY_GLOBAL_LIMIT = 20;
 
 @Injectable()
 export class TournamentsService {
@@ -62,6 +81,131 @@ export class TournamentsService {
     }
 
     return room;
+  }
+
+  // -----------------------------------------------------------------------
+  // Historial (Fase 2 — Gamificación: Ranking de Temporadas)
+  // -----------------------------------------------------------------------
+
+  /**
+   * Resumen Competitivo del usuario: torneos jugados, podios (top 3), total
+   * ganado y nivel derivado. Solo cuenta torneos cerrados (FINISHED/CANCELLED).
+   */
+  async getHistoryStats(userId: string): Promise<GetHistoryStatsDto> {
+    const participations = await this.prisma.roomParticipant.findMany({
+      where: {
+        userId,
+        room: {
+          status: { in: [RoomStatus.FINISHED, RoomStatus.CANCELLED] },
+        },
+      },
+      select: {
+        prizeWon: true,
+        position: true,
+        room: { select: { status: true } },
+      },
+    });
+
+    const tournamentsPlayed = participations.length;
+    const podiums = participations.filter(
+      (p) =>
+        p.room.status === RoomStatus.FINISHED &&
+        p.position !== null &&
+        p.position <= 3,
+    ).length;
+    const totalWon = round2(
+      participations.reduce((sum, p) => sum + p.prizeWon, 0),
+    );
+
+    return {
+      tournamentsPlayed,
+      podiums,
+      totalWon,
+      tier: computeTier(totalWon),
+    };
+  }
+
+  /**
+   * Últimos 20 torneos cerrados (FINISHED o CANCELLED). Los FINISHED incluyen
+   * el podio Top 4 (posición, usuario, puntos, premio) + pozo total y aforo.
+   */
+  async getHistoryGlobal(): Promise<GetHistoryGlobalDto> {
+    const rooms = await this.prisma.room.findMany({
+      where: {
+        status: { in: [RoomStatus.FINISHED, RoomStatus.CANCELLED] },
+      },
+      orderBy: { startTime: 'desc' },
+      take: HISTORY_GLOBAL_LIMIT,
+      include: {
+        participants: {
+          where: { position: { not: null } },
+          orderBy: [{ position: 'asc' }, { prizeWon: 'desc' }, { userId: 'asc' }],
+          take: 4,
+        },
+      },
+    });
+
+    return {
+      tournaments: rooms.map((room) => {
+        const finished = room.status === RoomStatus.FINISHED;
+
+        return {
+          roomId: room.id,
+          displayName: tournamentDisplayName(room.tournamentType),
+          tournamentType: room.tournamentType,
+          status: room.status,
+          startDate: room.startTime.toISOString(),
+          prizePool: room.prizePool,
+          capacity: room.maxPlayers,
+          currentPlayers: room.currentPlayers,
+          podium: finished
+            ? room.participants.map((p) => ({
+                position: p.position!,
+                userName: p.userName,
+                score: p.score,
+                prizeWon: p.prizeWon,
+              }))
+            : null,
+          fullyRefunded: !finished,
+          referenceId: room.id,
+        };
+      }),
+    };
+  }
+
+  /**
+   * Historial de los torneos cerrados donde participó el usuario, destacando
+   * su posición, sus puntos en la sala y el estado del torneo.
+   */
+  async getHistoryMe(userId: string): Promise<GetHistoryMeDto> {
+    const participations = await this.prisma.roomParticipant.findMany({
+      where: {
+        userId,
+        room: {
+          status: { in: [RoomStatus.FINISHED, RoomStatus.CANCELLED] },
+        },
+      },
+      orderBy: { room: { startTime: 'desc' } },
+      include: { room: true },
+    });
+
+    return {
+      tournaments: participations.map((p) => ({
+        roomId: p.roomId,
+        displayName: tournamentDisplayName(p.room.tournamentType),
+        tournamentType: p.room.tournamentType,
+        status: p.room.status,
+        startDate: p.room.startTime.toISOString(),
+        prizePool: p.room.prizePool,
+        capacity: p.room.maxPlayers,
+        currentPlayers: p.room.currentPlayers,
+        myPosition: p.position,
+        myScore: p.score,
+        myPrizeWon: p.prizeWon,
+        fullyRefunded: p.room.status === RoomStatus.CANCELLED,
+        referenceId: p.roomId,
+      })),
+    };
   }
 
   // -----------------------------------------------------------------------
@@ -490,4 +634,34 @@ function formatBogota(date: Date): string {
     dateStyle: 'short',
     timeStyle: 'medium',
   }).format(date);
+}
+
+/** Redondeo de moneda (centavos exactos). */
+function round2(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
+/** Nivel competitivo por total acumulado de premios. */
+function computeTier(totalWon: number): string {
+  if (totalWon > TIER_PLATINO_MAX) return 'Nivel Diamante';
+  if (totalWon > TIER_ORO_MAX) return 'Nivel Platino';
+  if (totalWon > TIER_PLATA_MAX) return 'Nivel Oro';
+  if (totalWon > TIER_BRONCE_MAX) return 'Nivel Plata';
+  return 'Nivel Bronce';
+}
+
+/** Título de torneo derivado del tipo (mockup: título a la izquierda). */
+function tournamentDisplayName(type: TournamentType): string {
+  switch (type) {
+    case TournamentType.DAILY:
+      return 'Torneo Diario';
+    case TournamentType.WEEKLY:
+      return 'Torneo Semanal';
+    case TournamentType.BIWEEKLY:
+      return 'Torneo Quincenal';
+    case TournamentType.CUSTOM_DATE:
+      return 'Torneo Especial';
+    default:
+      return 'Torneo';
+  }
 }

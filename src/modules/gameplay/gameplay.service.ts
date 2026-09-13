@@ -12,6 +12,8 @@ export const QUESTION_RESULTS_GRACE_MS = 5_000;
 export const SURVIVAL_ANNOUNCEMENT_MS = 5_000;
 export const DEFAULT_QUESTION_DURATION_MS = 7_000;
 export const DEFAULT_SURVIVAL_DURATION_S = 4;
+/** Puntos globales que otorga cada acierto en una pregunta (rankings de temporada). */
+export const POINTS_PER_CORRECT_ANSWER = 10;
 
 export interface ActiveQuestionState {
   roomId: string;
@@ -227,6 +229,7 @@ export class GameplayService {
 
     const eliminatedUserIds: string[] = [];
     const usedExtraLifeUserIds: string[] = [];
+    const correctUserIds: string[] = [];
     let correctCount = 0;
 
     for (const [userId, hasExtraLife] of state.extraLifeByUser) {
@@ -234,6 +237,7 @@ export class GameplayService {
 
       if (submitted === state.correctAnswer.trim()) {
         correctCount += 1;
+        correctUserIds.push(userId);
         continue;
       }
 
@@ -278,6 +282,22 @@ export class GameplayService {
         await tx.roomParticipant.updateMany({
           where: { roomId, userId: { in: usedExtraLifeUserIds } },
           data: { hasPurchasedExtraLife: false },
+        });
+      }
+
+      // Aciertos de la pregunta: +POINTS_PER_CORRECT_ANSWER en ambas fuentes de
+      // puntos (score del torneo en RoomParticipant y globalPoints de la
+      // temporada en User). Incrementos atómicos dentro de la misma transacción
+      // que aplica eliminaciones → sin doble conteo ni estados intermedios.
+      if (correctUserIds.length > 0) {
+        await tx.roomParticipant.updateMany({
+          where: { roomId, userId: { in: correctUserIds } },
+          data: { score: { increment: POINTS_PER_CORRECT_ANSWER } },
+        });
+
+        await tx.user.updateMany({
+          where: { id: { in: correctUserIds } },
+          data: { globalPoints: { increment: POINTS_PER_CORRECT_ANSWER } },
         });
       }
 

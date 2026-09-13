@@ -46,6 +46,11 @@ enum RoomStatus {
   CANCELLED
 }
 
+enum SeasonStatus {
+  ACTIVE
+  FINISHED
+}
+
 // --- MODELS ---
 model User {
   id                     String          @id @default(uuid())
@@ -55,6 +60,7 @@ model User {
   avatarUrl              String?         @map("avatar_url")
   status                 UserStatus      @default(ACTIVE)
   balanceLucas           Float           @default(0) @map("balance_lucas")
+  globalPoints           Int             @default(0) @map("global_points")
   isPro                  Boolean         @default(false) @map("is_pro")
   isVerified             Boolean         @default(false) @map("is_verified")
   phone                  String?
@@ -67,6 +73,7 @@ model User {
   preference             UserPreference?
   transactions           Transaction[]
   roomParticipations     RoomParticipant[]
+  seasonWins             SeasonWinner[]
 
   @@map("users")
 }
@@ -206,4 +213,38 @@ model SystemConfig {
   maintenanceMessage String? @map("maintenance_message")
 
   @@map("system_configs")
+}
+
+// --- TEMPORADAS (Ranking global de puntos) ---
+model Season {
+  id               String       @id @default(uuid())
+  startDate        DateTime     @map("start_date")
+  endDate          DateTime     @map("end_date")
+  firstPlacePrize  Float        @map("first_place_prize")
+  secondPlacePrize Float        @map("second_place_prize")
+  thirdPlacePrize  Float        @map("third_place_prize")
+  status           SeasonStatus @default(ACTIVE)
+  createdAt        DateTime     @default(now()) @map("created_at")
+  updatedAt        DateTime     @updatedAt @map("updated_at")
+
+  seasonWinners    SeasonWinner[]
+
+  @@map("seasons")
+}
+
+model SeasonWinner {
+  id           String    @id @default(uuid())
+  seasonId     String    @map("season_id")
+  userId       String    @map("user_id")
+  position     Int
+  prizeWon     Float     @map("prize_won")
+  pointsAtClose Int      @map("points_at_close")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  season       Season    @relation(fields: [seasonId], references: [id], onDelete: Cascade)
+  user         User      @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@unique([seasonId, position])
+  @@map("season_winners")
 }
