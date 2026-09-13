@@ -1,4 +1,9 @@
-import { Logger, OnModuleDestroy, UseFilters } from '@nestjs/common';
+import {
+  Logger,
+  OnApplicationBootstrap,
+  OnModuleDestroy,
+  UseFilters,
+} from '@nestjs/common';
 import {
   ConnectedSocket,
   MessageBody,
@@ -13,6 +18,7 @@ import type { AuthUser } from '../auth/jwt-auth.guard';
 import {
   GameplayService,
   QUESTION_RESULTS_GRACE_MS,
+  SURVIVAL_ANNOUNCEMENT_MS,
   type QuestionStarted,
   type QuestionStartedPayload,
   type SubmitAnswerResult,
@@ -50,7 +56,11 @@ type GameplaySocket = Socket<
 })
 @UseFilters(WsGameplayExceptionsFilter)
 export class GameplayGateway
-  implements OnGatewayConnection, OnGatewayDisconnect, OnModuleDestroy
+  implements
+    OnGatewayConnection,
+    OnGatewayDisconnect,
+    OnModuleDestroy,
+    OnApplicationBootstrap
 {
   private readonly logger = new Logger(GameplayGateway.name);
   private readonly finishTimers = new Map<string, NodeJS.Timeout>();
@@ -58,6 +68,9 @@ export class GameplayGateway
 
   /** Salas en ventana de inicio (`roomId` → timestamp de la 1ª pregunta). */
   private readonly startingGames = new Map<string, number>();
+
+  /** Timers que lanzan la 1ª pregunta tras el countdown de inicio. */
+  private readonly firstQuestionTimers = new Map<string, NodeJS.Timeout>();
 
   @WebSocketServer()
   server!: Server;
@@ -69,6 +82,10 @@ export class GameplayGateway
 
   async handleConnection(client: GameplaySocket): Promise<void> {
     const token = this.extractToken(client);
+
+    this.logger.log(
+      `[conn] CONNECT id=${client.id} namespace=${client.nsp.name} transport=${client.conn?.transport?.name ?? '?'} token=${token ? 'PRESENTE' : 'AUSENTE'} hora=${new Date().toISOString()}`,
+    );
 
     if (!token) {
       this.logger.warn('Conexión rechazada al namespace /gameplay: sin token.');
@@ -100,6 +117,9 @@ export class GameplayGateway
   }
 
   handleDisconnect(client: GameplaySocket): void {
+    this.logger.log(
+      `[conn] DISCONNECT id=${client.id} room=${client.data.roomId ?? '—'} hora=${new Date().toISOString()}`,
+    );
     client.data.roomId = undefined;
   }
 
@@ -108,6 +128,10 @@ export class GameplayGateway
     @ConnectedSocket() client: GameplaySocket,
     @MessageBody() dto: JoinRoomDto,
   ): Promise<JoinRoomAck> {
+    this.logger.log(
+      `[join_room] ENTRADA id=${client.id} user=${client.data.user?.sub ?? 'NULO'} payload=${JSON.stringify(dto)} hora=${new Date().toISOString()}`,
+    );
+
     const user = client.data.user;
 
     if (!user) {
@@ -134,13 +158,20 @@ export class GameplayGateway
       await client.join(dto.roomId);
       client.data.roomId = dto.roomId;
 
+      const activeQuestion = this.gameplayService.getActiveQuestion(dto.roomId);
+      const gameStarting = this.getGameStarting(dto.roomId);
+
+      this.logger.log(
+        `[join_room] ACK_ENVIADO ok user=${user.sub} room=${dto.roomId} activeQ=${activeQuestion?.questionId ?? 'ninguna'} start=${gameStarting?.startTime ?? null}`,
+      );
+
       return {
         event: 'join_room',
         data: {
           ok: true,
           roomId: dto.roomId,
-          activeQuestion: this.gameplayService.getActiveQuestion(dto.roomId),
-          gameStarting: this.getGameStarting(dto.roomId),
+          activeQuestion,
+          gameStarting,
         },
       };
     } catch (error) {
@@ -216,18 +247,117 @@ export class GameplayGateway
   }
 
   /**
-   * Activa la ventana de inicio de la partida: anuncia a la sala y registra el
+   * Activa la ventana de inicio de la partida: anuncia a la sala, registra el
    * `startTime` (instante en que arranca la primera pregunta) para que los
    * clientes que conecten durante este lapso lo reciban vía el ack de
-   * `join_room` y puedan mostrar su contador 5, 4, 3, 2, 1.
+   * `join_room` (contador 5, 4, 3, 2, 1) y agenda internamente el disparo de
+   * la primera pregunta con un timer (no bloquea el cron).
    */
   startGameCountdown(roomId: string, startTime: number): void {
     this.startingGames.set(roomId, startTime);
     this.server.to(roomId).emit('game_starting', { startTime });
 
+    const delayMs = Math.max(0, startTime - Date.now());
+    const previous = this.firstQuestionTimers.get(roomId);
+
+    if (previous) {
+      clearTimeout(previous);
+    }
+
+    const timer = setTimeout(() => {
+      this.firstQuestionTimers.delete(roomId);
+      void this.startFirstQuestion(roomId);
+    }, delayMs);
+
+    this.firstQuestionTimers.set(roomId, timer);
+
     this.logger.log(
-      `Sala ${roomId} en ventana de inicio (#1 pregunta a las ${startTime})`,
+      `Sala ${roomId} en ventana de inicio (#1 pregunta a las ${startTime}, en ${delayMs} ms)`,
     );
+  }
+
+  /**
+   * Lanza la 1ª pregunta (tras el countdown). Si no hay forma de continuar
+   * (sin categoría, sin preguntas), cierra la sala con los supervivientes.
+   */
+  private async startFirstQuestion(roomId: string): Promise<void> {
+    const started = await this.gameplayService.startQuestion(roomId);
+
+    if (!started) {
+      const winnerIds =
+        await this.gameplayService.getAliveParticipantIds(roomId);
+      await this.finishGame(roomId, winnerIds, winnerIds.length);
+      return;
+    }
+
+    this.broadcastQuestionStarted(roomId, started);
+  }
+
+  // ------------------------------------------------------------------
+  // Recuperación al reinicio del servidor
+  // ------------------------------------------------------------------
+
+  async onApplicationBootstrap(): Promise<void> {
+    await this.recoverActiveRooms();
+  }
+
+  /**
+   * Reanuda las salas que quedaron en ACTIVE tras un reinicio (corte, deploy).
+   * El estado persistido (`questionCursor`, `survivalMode`, deadlines) permite
+   * seguir exactamente donde se quedó sin repetir preguntas.
+   */
+  private async recoverActiveRooms(): Promise<void> {
+    const roomIds = await this.gameplayService.getActiveRoomIds();
+
+    if (roomIds.length === 0) {
+      return;
+    }
+
+    this.logger.log(
+      `Recuperando ${roomIds.length} sala(s) en ACTIVE tras el reinicio...`,
+    );
+
+    for (const roomId of roomIds) {
+      try {
+        const survivorIds =
+          await this.gameplayService.getAliveParticipantIds(roomId);
+
+        if (survivorIds.length === 1) {
+          // Un solo superviviente → era el ganador.
+          await this.finishGame(roomId, survivorIds, 1);
+          continue;
+        }
+
+        if (survivorIds.length === 0) {
+          // Sin supervivientes (estado corrupto): liquidar sin premios.
+          await this.finishGame(roomId, [], 0);
+          continue;
+        }
+
+        // >1 superviviente: se debe continuar. Si la fase normal se agotó
+        // justo antes del corte, entrar en survival en lugar de preguntar.
+        const survival =
+          await this.gameplayService.shouldEnterSurvival(roomId);
+
+        if (survival) {
+          await this.startSurvivalMode(roomId);
+          continue;
+        }
+
+        const started = await this.gameplayService.startQuestion(roomId);
+
+        if (!started) {
+          await this.finishGame(roomId, survivorIds, survivorIds.length);
+        }
+      } catch (error) {
+        this.logger.error(
+          `Error recuperando sala ${roomId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+          error instanceof Error ? error.stack : undefined,
+        );
+      }
+    }
   }
 
   /**
@@ -281,25 +411,24 @@ export class GameplayGateway
     );
   }
 
-  /** Variante para salas sin pregunta activa: ganan quienes siguen vivos. */
-  async finishGameWithAlive(roomId: string): Promise<void> {
-    const winnerIds = await this.gameplayService.getAliveParticipantIds(roomId);
-    await this.finishGame(roomId, winnerIds, winnerIds.length);
-  }
-
   onModuleDestroy(): void {
-    for (const timer of this.finishTimers.values()) {
-      clearTimeout(timer);
-    }
-
-    for (const timer of this.nextQuestionTimers.values()) {
-      clearTimeout(timer);
-    }
-
-    this.finishTimers.clear();
-    this.nextQuestionTimers.clear();
-    this.startingGames.clear();
+  for (const timer of this.finishTimers.values()) {
+    clearTimeout(timer);
   }
+
+  for (const timer of this.nextQuestionTimers.values()) {
+    clearTimeout(timer);
+  }
+
+  for (const timer of this.firstQuestionTimers.values()) {
+    clearTimeout(timer);
+  }
+
+  this.finishTimers.clear();
+  this.nextQuestionTimers.clear();
+  this.firstQuestionTimers.clear();
+  this.startingGames.clear();
+}
 
   private scheduleFinish(
     roomId: string,
@@ -340,10 +469,23 @@ export class GameplayGateway
       `Pregunta ${questionId} finalizada en sala ${roomId}: ${results.survivors} superviviente(s)`,
     );
 
+    if (results.survivors === 1) {
+      // GANADOR ÚNICO: el torneo termina de inmediato con premio 100% del pozo.
+      const winnerIds =
+        await this.gameplayService.getAliveParticipantIds(roomId);
+      await this.finishGame(roomId, winnerIds, 1);
+      return;
+    }
+
+    // `results.survivors === 0` ya no ocurre: la muerte súbita total se
+    // resuelve en el servicio repitiendo la ronda (nadie eliminado). Nota: si
+    // por inconsistencia de datos llegara, se trata como ganadores = vivos.
     if (results.survivors === 0) {
-      // Muerte súbita total: todos los que llegaron vivos a la pregunta N
-      // comparten el pozo en partes iguales (Excepción 1).
-      await this.finishGame(roomId, results.aliveAtStartUserIds, 0);
+      await this.finishGame(
+        roomId,
+        results.aliveAtStartUserIds,
+        results.aliveAtStartUserIds.length,
+      );
       return;
     }
 
@@ -359,12 +501,68 @@ export class GameplayGateway
     roomId: string,
     lastSurvivors: number,
   ): Promise<void> {
+    // ¿Se agotó el set normal? → se entra en modo supervivencia.
+    const shouldEnterSurvival =
+      await this.gameplayService.shouldEnterSurvival(roomId);
+
+    if (shouldEnterSurvival) {
+      await this.startSurvivalMode(roomId);
+      return;
+    }
+
     const started = await this.gameplayService.startQuestion(roomId);
 
     if (!started) {
       const winnerIds =
         await this.gameplayService.getAliveParticipantIds(roomId);
       await this.finishGame(roomId, winnerIds, lastSurvivors);
+      return;
+    }
+
+    this.broadcastQuestionStarted(roomId, started);
+  }
+
+  /**
+   * Anuncio de 5s de MODO SUPERVIVENCIA + nueva configuración de tiempo, y
+   * agenda la primera pregunta de supervivencia.
+   */
+  private async startSurvivalMode(roomId: string): Promise<void> {
+    const spec = await this.gameplayService.enableSurvivalMode(roomId);
+
+    if (!spec) {
+      // No se pudo activar (sala ya no ACTIVE o duplicado raro): cierre seguro.
+      const winnerIds =
+        await this.gameplayService.getAliveParticipantIds(roomId);
+      await this.finishGame(roomId, winnerIds, winnerIds.length);
+      return;
+    }
+
+    this.server.to(roomId).emit('game_survival_started', {
+      roomId,
+      startTime: Date.now(),
+      duration: spec.durationMs,
+    });
+
+    this.logger.log(
+      `Sala ${roomId}: anuncio de supervivencia emitido (duración ${spec.durationMs} ms, primera pregunta en ${SURVIVAL_ANNOUNCEMENT_MS} ms)`,
+    );
+
+    const timer = setTimeout(() => {
+      this.nextQuestionTimers.delete(roomId);
+      void this.startFirstSurvivalQuestion(roomId);
+    }, SURVIVAL_ANNOUNCEMENT_MS);
+
+    this.nextQuestionTimers.set(roomId, timer);
+  }
+
+  /** Primera pregunta de supervivencia (después del banner de 5s). */
+  private async startFirstSurvivalQuestion(roomId: string): Promise<void> {
+    const started = await this.gameplayService.startQuestion(roomId);
+
+    if (!started) {
+      const winnerIds =
+        await this.gameplayService.getAliveParticipantIds(roomId);
+      await this.finishGame(roomId, winnerIds, winnerIds.length);
       return;
     }
 

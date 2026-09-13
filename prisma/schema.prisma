@@ -125,6 +125,14 @@ model Room {
   normalQuestionCount      Int            @map("normal_question_count")
   normalQuestionDuration   Int            @default(7) @map("normal_question_duration")
   survivalQuestionDuration Int            @default(4) @map("survival_question_duration")
+
+  // Deadlines de fase (mensurables, calculados). `startTime` ES INMUTABLE:
+  // solo se trabaja con estos campos + aritmética de fechas.
+  waitingClosesAt DateTime?  @map("waiting_closes_at")
+  votingClosesAt  DateTime?  @map("voting_closes_at")
+  // Avance de preguntas persistido (sobrevive reinicios del servidor).
+  questionCursor  Int        @default(0) @map("question_cursor")
+  survivalMode    Boolean    @default(false) @map("survival_mode")
   
   createdAt      DateTime       @default(now()) @map("created_at")
 

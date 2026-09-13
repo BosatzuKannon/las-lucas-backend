@@ -9,7 +9,9 @@ import { PrismaService } from '../../prisma/prisma.service';
 
 export const LATENCY_MARGIN_MS = 500;
 export const QUESTION_RESULTS_GRACE_MS = 5_000;
+export const SURVIVAL_ANNOUNCEMENT_MS = 5_000;
 export const DEFAULT_QUESTION_DURATION_MS = 7_000;
+export const DEFAULT_SURVIVAL_DURATION_S = 4;
 
 export interface ActiveQuestionState {
   roomId: string;
@@ -18,6 +20,7 @@ export interface ActiveQuestionState {
   options: string[];
   correctAnswer: string;
   endTime: number;
+  isSurvival: boolean;
   answers: Map<string, string>;
   extraLifeByUser: Map<string, boolean>;
 }
@@ -27,6 +30,8 @@ export interface QuestionStartedPayload {
   text: string;
   options: string[];
   endTime: number;
+  /** true si la pregunta pertenece a la fase de supervivencia. */
+  isSurvival: boolean;
 }
 
 export interface QuestionStarted {
@@ -85,7 +90,6 @@ export class GameplayService {
   private readonly logger = new Logger(GameplayService.name);
 
   private readonly activeQuestions = new Map<string, ActiveQuestionState>();
-  private readonly questionCursor = new Map<string, number>();
 
   constructor(private readonly prisma: PrismaService) {}
 
@@ -100,6 +104,9 @@ export class GameplayService {
         selectedCategoryId: true,
         normalQuestionCount: true,
         normalQuestionDuration: true,
+        survivalQuestionDuration: true,
+        survivalMode: true,
+        questionCursor: true,
       },
     });
 
@@ -109,11 +116,7 @@ export class GameplayService {
 
     const question = questionId
       ? await this.prisma.question.findUnique({ where: { id: questionId } })
-      : await this.pickNextQuestion(
-          roomId,
-          room.selectedCategoryId,
-          room.normalQuestionCount,
-        );
+      : await this.pickNextQuestion(roomId, room);
 
     if (!question) {
       return null;
@@ -125,9 +128,14 @@ export class GameplayService {
     });
 
     const durationMs =
-      (room.normalQuestionDuration > 0
-        ? room.normalQuestionDuration
-        : DEFAULT_QUESTION_DURATION_MS / 1000) * 1000;
+      (room.survivalMode
+        ? room.survivalQuestionDuration > 0
+          ? room.survivalQuestionDuration
+          : DEFAULT_SURVIVAL_DURATION_S
+        : room.normalQuestionDuration > 0
+          ? room.normalQuestionDuration
+          : DEFAULT_QUESTION_DURATION_MS / 1000) * 1000;
+
     const endTime = Date.now() + durationMs;
     const options = question.options as unknown as string[];
 
@@ -138,6 +146,7 @@ export class GameplayService {
       options,
       correctAnswer: question.correctAnswer,
       endTime,
+      isSurvival: room.survivalMode,
       answers: new Map(),
       extraLifeByUser: new Map(
         participants.map((p) => [p.userId, p.hasPurchasedExtraLife] as const),
@@ -151,6 +160,7 @@ export class GameplayService {
         text: question.text,
         options,
         endTime,
+        isSurvival: room.survivalMode,
       },
       correctAnswer: question.correctAnswer,
       endTime,
@@ -201,10 +211,17 @@ export class GameplayService {
     }
 
     // Conjunto "llegados vivos a esta pregunta": se captura ANTES de borrar el
-    // estado (Excepción 1 → muerte súbita total).
+    // estado. Este conjunto define el total de jugadores en juego.
     const aliveAtStartUserIds = [...state.extraLifeByUser.keys()];
-    // Número (1-based) de la pregunta que acaba de cerrar.
-    const questionIndex = this.questionCursor.get(roomId) ?? 0;
+
+    // Número (1-based) de la pregunta que acaba de cerrar. El cursor se
+    // incrementó persistiéndolo cuando se eligió la pregunta, así que el valor
+    // en BD coincide con el número de la pregunta EN CURSO.
+    const room = await this.prisma.room.findUnique({
+      where: { id: roomId },
+      select: { questionCursor: true },
+    });
+    const questionIndex = room?.questionCursor ?? 0;
 
     this.activeQuestions.delete(roomId);
 
@@ -225,6 +242,28 @@ export class GameplayService {
       } else {
         eliminatedUserIds.push(userId);
       }
+    }
+
+    // MUERTE SÚBITA TOTAL: todos los que llegaron vivos fallaron (ninguno
+    // acierta y ninguno tenía vida extra para salvarse). Regla de negocio:
+    // nadie es eliminado y se repregunta en la siguiente ronda. Así el torneo
+    // SIEMPRE culmina con 1 ganador único.
+    const totalAlive = aliveAtStartUserIds.length;
+    if (eliminatedUserIds.length > 0 && eliminatedUserIds.length === totalAlive) {
+      this.logger.log(
+        `Pregunta ${state.questionId} de sala ${roomId}: MUERTE SÚBITA (${totalAlive} fallaron) → nadie eliminado, se repite ronda`,
+      );
+
+      return {
+        questionId: state.questionId,
+        correctAnswer: state.correctAnswer,
+        correctCount,
+        aliveAtStart: totalAlive,
+        aliveAtStartUserIds,
+        survivors: totalAlive,
+        eliminatedUserIds: [],
+        usedExtraLifeUserIds: [],
+      };
     }
 
     const survivors = await this.prisma.$transaction(async (tx) => {
@@ -255,7 +294,7 @@ export class GameplayService {
       questionId: state.questionId,
       correctAnswer: state.correctAnswer,
       correctCount,
-      aliveAtStart: state.extraLifeByUser.size,
+      aliveAtStart: totalAlive,
       aliveAtStartUserIds,
       survivors,
       eliminatedUserIds,
@@ -275,6 +314,7 @@ export class GameplayService {
       text: state.text,
       options: state.options,
       endTime: state.endTime,
+      isSurvival: state.isSurvival,
     };
   }
 
@@ -327,14 +367,105 @@ export class GameplayService {
     return rows.map((r) => r.userId);
   }
 
+  // ------------------------------------------------------------------
+  // Supervivencia (survival)
+  // ------------------------------------------------------------------
+
   /**
-   * Liquida la sala de forma atómica (Excepción 3):
-   *  1. Claim de idempotencia ACTIVE→FINISHED; si otra ejecución ya liquidó,
-   *     count === 0 → no se paga nada (nunca dos veces, ni tras reinicio).
-   *  2. Abona balanceLucas de los ganadores.
-   *  3. Crea una Transaction PRIZE/COMPLETED por ganador con reference única
-   *     por usuario + skipDuplicates (candado extra anti duplicados).
-   *  4. Persiste position + prizeWon de TODOS los participantes.
+   * Indica si la fase normal se agotó y se debe entrar en modo survival
+   * (necesita modo survival + cursor ≥ normalQuestionCount).
+   * No escribe nada; solo lee.
+   */
+  async shouldEnterSurvival(roomId: string): Promise<boolean> {
+    const room = await this.prisma.room.findUnique({
+      where: { id: roomId },
+      select: {
+        status: true,
+        survivalMode: true,
+        questionCursor: true,
+        normalQuestionCount: true,
+      },
+    });
+
+    return (
+      !!room &&
+      room.status === RoomStatus.ACTIVE &&
+      !room.survivalMode &&
+      room.normalQuestionCount > 0 &&
+      room.questionCursor >= room.normalQuestionCount
+    );
+  }
+
+  /**
+   * Activa `survivalMode` en la sala (claim atómico) y devuelve la duración
+   * de respuesta para supervivencia en milisegundos. Si ya estaba activo o la
+   * sala cambió de estado, devuelve `null`.
+   */
+  async enableSurvivalMode(
+    roomId: string,
+  ): Promise<{ durationMs: number } | null> {
+    const room = await this.prisma.room.findUnique({
+      where: { id: roomId },
+      select: {
+        status: true,
+        survivalMode: true,
+        survivalQuestionDuration: true,
+      },
+    });
+
+    if (!room || room.status !== RoomStatus.ACTIVE) {
+      return null;
+    }
+
+    if (room.survivalMode) {
+      // Ya fue activado (posible doble disparo). Devolver la duración igual.
+      return {
+        durationMs:
+          (room.survivalQuestionDuration > 0
+            ? room.survivalQuestionDuration
+            : DEFAULT_SURVIVAL_DURATION_S) * 1000,
+      };
+    }
+
+    const claimed = await this.prisma.room.updateMany({
+      where: { id: roomId, status: RoomStatus.ACTIVE, survivalMode: false },
+      data: { survivalMode: true },
+    });
+
+    if (claimed.count === 0) {
+      return null;
+    }
+
+    this.logger.log(`Sala ${roomId}: modo survival activado`);
+
+    return {
+      durationMs:
+        (room.survivalQuestionDuration > 0
+          ? room.survivalQuestionDuration
+          : DEFAULT_SURVIVAL_DURATION_S) * 1000,
+    };
+  }
+
+  /**
+   * IDs de todas las salas en ACTIVE (usado por la recuperación al reinicio).
+   */
+  async getActiveRoomIds(): Promise<string[]> {
+    const rows = await this.prisma.room.findMany({
+      where: { status: RoomStatus.ACTIVE },
+      select: { id: true },
+    });
+    return rows.map((r) => r.id);
+  }
+
+  // ------------------------------------------------------------------
+  // Liquidación
+  // ------------------------------------------------------------------
+
+  /**
+   * Liquida la sala de forma atómica (idempotente):
+   *  1. Claim ACTIVE → FINISHED. Si ya fue liquidada, count===0 → no paga.
+   *  2. Abona balance de los ganadores.
+   *  3. Persiste position + prizeWon de TODOS.
    * Las posiciones y montos se calculan ANTES, en memoria (`buildSettlement`).
    */
   async settleRoom(
@@ -508,36 +639,65 @@ export class GameplayService {
 
   disposeRoom(roomId: string): void {
     this.activeQuestions.delete(roomId);
-    this.questionCursor.delete(roomId);
+    // `questionCursor`, `survivalMode` y deadlines viven en BD (sobreviven reinicios).
   }
 
+  /**
+   * Elige la siguiente pregunta desde la categoría seleccionada. El cursor se
+   * incrementa y persiste al instante para que una caída del servidor no
+   * repita la misma pregunta (vista como pregunta N+1 por el cliente que se
+   * reconecta).
+   *
+   * Modo normal: avanza secuencial hasta `normalQuestionCount`.
+   * Modo survival: recicla preguntas indefinidamente.
+   */
   private async pickNextQuestion(
     roomId: string,
-    categoryId: string | null,
-    totalQuestions: number,
+    room: {
+      selectedCategoryId: string | null;
+      normalQuestionCount: number;
+      survivalMode: boolean;
+      questionCursor: number;
+    },
   ): Promise<Question | null> {
-    const cursor = this.questionCursor.get(roomId) ?? 0;
-
-    if (totalQuestions > 0 && cursor >= totalQuestions) {
-      return null;
-    }
-
-    this.questionCursor.set(roomId, cursor + 1);
+    const categoryId = room.selectedCategoryId;
 
     if (!categoryId) {
       return null;
     }
 
-    const question = await this.prisma.question.findFirst({
-      where: { categoryId },
-      orderBy: [{ difficulty: 'asc' }, { id: 'asc' }],
-      skip: cursor,
-    });
-
-    if (question) {
-      return question;
+    // En modo normal, el cursor no puede superar el conteo de preguntas normales
+    // (el gateway primero activa survival; si aún no lo hizo, regresamos null).
+    if (!room.survivalMode && room.questionCursor >= room.normalQuestionCount) {
+      return null;
     }
 
-    return this.prisma.question.findFirst({ where: { categoryId } });
+    const questions = await this.prisma.question.findMany({
+      where: { categoryId },
+      orderBy: [{ difficulty: 'asc' }, { id: 'asc' }],
+    });
+
+    if (questions.length === 0) {
+      return null;
+    }
+
+    const index = room.survivalMode
+      ? room.questionCursor % questions.length
+      : Math.min(room.questionCursor, questions.length - 1);
+
+    const question = questions[index];
+
+    if (!question) {
+      return null;
+    }
+
+    // Incrementa el cursor y lo persiste. Con `updateMany` con guardia de
+    // estado (status = ACTIVE) evita corrupción si la sala ya terminó.
+    await this.prisma.room.updateMany({
+      where: { id: roomId, status: RoomStatus.ACTIVE },
+      data: { questionCursor: { increment: 1 } },
+    });
+
+    return question;
   }
 }

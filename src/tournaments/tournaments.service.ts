@@ -16,17 +16,10 @@ const WAITING_WINDOW_MS = 10 * 60 * 1000;
 /** Duración de la fase de votación de categoría (45 segundos). */
 const VOTING_WINDOW_MS = 45 * 1000;
 
-/**
- * Buffer de conexión al pasar una sala a ACTIVE: tiempo que se espera antes de
- * disparar la primera pregunta para que los clientes React Native terminen de
- * montar GameplayScreen y conecten su WebSocket al namespace `/gameplay`.
- */
+/** Buffer de conexión al pasar una sala a ACTIVE: la primera pregunta se
+ * dispara a los 5 s para que los clientes React Native terminen de montar
+ * GameplayScreen y conecten su WebSocket al namespace `/gameplay`. */
 const GAME_START_CONNECTION_BUFFER_MS = 5_000;
-
-/** Pausa asíncrona que no bloquea el event loop. */
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 @Injectable()
 export class TournamentsService {
@@ -154,16 +147,16 @@ export class TournamentsService {
 
       // Si se completa la sala, pasar directamente a la fase VOTING (no ACTIVE).
       if (updatedRoom.currentPlayers >= updatedRoom.maxPlayers) {
-        const votingDeadline = new Date(Date.now() + VOTING_WINDOW_MS);
+        const votingClosesAt = new Date(Date.now() + VOTING_WINDOW_MS);
         updatedRoom = await tx.room.update({
           where: { id: roomId },
           data: {
             status: RoomStatus.VOTING,
-            startTime: votingDeadline,
+            votingClosesAt,
           },
         });
         this.logger.log(
-          `Sala ${roomId} WAITING → VOTING (llenada por inscripción, cierre de votación ${formatBogota(votingDeadline)})`,
+          `Sala ${roomId} WAITING → VOTING (llenada por inscripción, cierre de votación ${formatBogota(votingClosesAt)})`,
         );
       }
 
@@ -185,6 +178,14 @@ export class TournamentsService {
     if (room.status !== RoomStatus.VOTING) {
       throw new BadRequestException(
         'La votación de categorías no está abierta para esta sala',
+      );
+    }
+
+    const votingDeadline = room.votingClosesAt;
+
+    if (!votingDeadline || votingDeadline.getTime() <= Date.now()) {
+      throw new BadRequestException(
+        'La votación de categorías ya cerró para esta sala',
       );
     }
 
@@ -232,195 +233,203 @@ export class TournamentsService {
   // Cron / Lifecycle
   // -----------------------------------------------------------------------
 
-  @Interval(30_000)
+  /**
+   * Motor de fases (1 tick/segundo). Trabaja SIEMPRE con deadlines calculados
+   * (`waitingClosesAt` / `votingClosesAt`); NUNCA reescribe `startTime`
+   * (la hora programada es inamovible, sensa a retrasos del tick).
+   */
+  @Interval(1_000)
   async processRoomLifecycle() {
     const now = new Date();
 
-    const openingTime = new Date(now.getTime() + WAITING_WINDOW_MS);
+    await this.openScheduledRooms(now);
+    await this.processWaitingRooms(now);
+    await this.processVotingRooms(now);
+  }
 
-    const { count: scheduledToWaiting } = await this.prisma.room.updateMany({
+  /** SCHEDULED → WAITING exactamente cuando `startTime` se cumple (nunca antes). */
+  private async openScheduledRooms(now: Date) {
+    const due = await this.prisma.room.findMany({
       where: {
         status: RoomStatus.SCHEDULED,
-        startTime: { lte: openingTime },
+        startTime: { lte: now },
       },
-      data: {
-        status: RoomStatus.WAITING,
-        startTime: openingTime,
-      },
+      select: { id: true, startTime: true },
     });
 
-    if (scheduledToWaiting > 0) {
-      this.logger.log(
-        `${scheduledToWaiting} sala(s) abiertas → WAITING, ventana garantizada de 10 min desde ${formatBogota(
-          openingTime,
-        )}`,
+    for (const room of due) {
+      const waitingClosesAt = new Date(
+        room.startTime.getTime() + WAITING_WINDOW_MS,
       );
-    }
 
+      const { count } = await this.prisma.room.updateMany({
+        where: { id: room.id, status: RoomStatus.SCHEDULED },
+        data: {
+          status: RoomStatus.WAITING,
+          waitingClosesAt,
+        },
+      });
+
+      if (count > 0) {
+        this.logger.log(
+          `Sala ${room.id} SCHEDULED → WAITING (apertura ${formatBogota(room.startTime)}, cierre de espera ${formatBogota(waitingClosesAt)})`,
+        );
+      }
+    }
+  }
+
+  /** WAITING: llena → VOTING (deadline = ahora + 45 s); vencida → CANCELLED + reembolso. */
+  private async processWaitingRooms(now: Date) {
     const waitingRooms = await this.prisma.room.findMany({
       where: { status: RoomStatus.WAITING },
     });
 
     for (const room of waitingRooms) {
       if (room.currentPlayers >= room.maxPlayers) {
-        const votingDeadline = new Date(Date.now() + VOTING_WINDOW_MS);
+        const votingClosesAt = new Date(Date.now() + VOTING_WINDOW_MS);
+
         const { count } = await this.prisma.room.updateMany({
           where: { id: room.id, status: RoomStatus.WAITING },
           data: {
             status: RoomStatus.VOTING,
-            startTime: votingDeadline,
+            votingClosesAt,
           },
         });
+
         if (count > 0) {
           this.logger.log(
-            `Sala ${room.id} WAITING → VOTING (llena) (cierre ${formatBogota(votingDeadline)})`,
+            `Sala ${room.id} WAITING → VOTING (llena, cierre ${formatBogota(votingClosesAt)})`,
           );
         }
-      } else if (room.startTime <= now) {
+
+        continue;
+      }
+
+      const deadline =
+        room.waitingClosesAt ??
+        new Date(room.startTime.getTime() + WAITING_WINDOW_MS);
+
+      if (deadline <= now) {
         await this.cancelAndRefund(room.id);
       }
     }
   }
 
   /**
-   * Worker que cierra la fase de votación de todas las salas en VOTING cuyo
-   * tiempo de cierre (startTime) ya pasó.
-   *
-   * Desempate por votos:
-   *  - 0 votos → selección aleatoria entre categorías activas.
-   *  - 1er lugar empatado → gana la categoría cuyo último voto fue más
-   *    temprano (MIN(votePerCategory.MAX(votedAt))).
+   * VOTING → ACTIVE una vez vencido `votingClosesAt`: elige la categoría
+   * ganadora, activa la partida y lanza el countdown de 5 s + primera
+   * pregunta. La primera pregunta se dispara con un timer interno del gateway
+   * (no bloquea este cron).
    */
-  @Interval(5_000)
-  async processVotingRooms() {
-    const now = new Date();
-
-    const votingRooms = await this.prisma.room.findMany({
+  private async processVotingRooms(now: Date) {
+    const due = await this.prisma.room.findMany({
       where: {
         status: RoomStatus.VOTING,
-        startTime: { lte: now },
+        votingClosesAt: { lte: now },
       },
-      select: {
-        id: true,
-        startTime: true,
+      select: { id: true },
+    });
+
+    for (const room of due) {
+      await this.closeVotingAndStartGame(room.id);
+    }
+  }
+
+  /** Resuelve la votación, cambia a ACTIVE y dispara el countdown. */
+  private async closeVotingAndStartGame(roomId: string) {
+    const selectedCategoryId = await this.selectWinningCategory(roomId);
+
+    const { count } = await this.prisma.room.updateMany({
+      where: { id: roomId, status: RoomStatus.VOTING },
+      data: {
+        status: RoomStatus.ACTIVE,
+        selectedCategoryId,
+        votingClosesAt: null,
       },
     });
 
-    if (votingRooms.length === 0) {
-      return;
+    if (count === 0) {
+      return; // ya fue procesada (otro tick / inscripción simultánea).
     }
 
     this.logger.log(
-      `Cerrando votación de ${votingRooms.length} sala(s)… (${formatBogota(now)})`,
+      `Sala ${roomId} VOTING → ACTIVE (categoría: ${selectedCategoryId ?? 'N/A'})`,
     );
 
-    for (const room of votingRooms) {
-      const participants = await this.prisma.roomParticipant.findMany({
-        where: {
-          roomId: room.id,
-          votedCategoryId: { not: null },
-        },
-        select: {
-          votedCategoryId: true,
-          votedAt: true,
-        },
+    // Buffer de conexión (5 s): la sala ya está ACTIVE y el cron no la vuelve
+    // a procesar. El gateway dispara la 1ª pregunta a los 5 s.
+    const startTime = Date.now() + GAME_START_CONNECTION_BUFFER_MS;
+    this.gameplayGateway.startGameCountdown(roomId, startTime);
+  }
+
+  /** Elige la categoría ganadora de la votación de una sala (candado por sala). */
+  private async selectWinningCategory(roomId: string): Promise<string | null> {
+    const participants = await this.prisma.roomParticipant.findMany({
+      where: {
+        roomId,
+        votedCategoryId: { not: null },
+      },
+      select: {
+        votedCategoryId: true,
+        votedAt: true,
+      },
+    });
+
+    if (participants.length === 0) {
+      // 0 votos → categoría activa aleatoria.
+      const activeCategories = await this.prisma.category.findMany({
+        where: { isActive: true },
+        select: { id: true },
       });
 
-      let selectedCategoryId: string | null = null;
-
-      if (participants.length === 0) {
-        // 0 votos → categoría activa aleatoria.
-        const activeCategories = await this.prisma.category.findMany({
-          where: { isActive: true },
-          select: { id: true },
-        });
-
-        if (activeCategories.length > 0) {
-          selectedCategoryId =
-            activeCategories[
-              Math.floor(Math.random() * activeCategories.length)
-            ].id;
-        } else {
-          // Fallback: cualquier categoría.
-          const anyCategory = await this.prisma.category.findFirst({
-            select: { id: true },
-          });
-          selectedCategoryId = anyCategory?.id ?? null;
-        }
-
-        this.logger.log(
-          `Sala ${room.id}: 0 votos → categoría aleatoria: ${selectedCategoryId ?? 'N/A'}`,
-        );
-      } else {
-        // Contar votos por categoría.
-        const counts = new Map<string, number>();
-        const lastVotedAt = new Map<string, number>();
-
-        for (const p of participants) {
-          const catId = p.votedCategoryId!;
-          counts.set(catId, (counts.get(catId) ?? 0) + 1);
-          const t = p.votedAt?.getTime() ?? 0;
-          const prev = lastVotedAt.get(catId) ?? 0;
-          if (t > prev) lastVotedAt.set(catId, t);
-        }
-
-        // Máxima cantidad de votos.
-        let maxCount = 0;
-        for (const n of counts.values()) {
-          if (n > maxCount) maxCount = n;
-        }
-
-        // Categorías empatadas en primer lugar.
-        const leaders = [...counts.entries()]
-          .filter(([, n]) => n === maxCount)
-          .map(([catId]) => catId);
-
-        // Desempate: MIN(MAX(votedAt)) → el que tiene el último voto más temprano.
-        let bestCat = leaders[0];
-        let bestLastVote = lastVotedAt.get(bestCat) ?? Infinity;
-
-        for (const catId of leaders.slice(1)) {
-          const t = lastVotedAt.get(catId) ?? Infinity;
-          if (t < bestLastVote) {
-            bestCat = catId;
-            bestLastVote = t;
-          }
-        }
-
-        selectedCategoryId = bestCat;
-        this.logger.log(
-          `Sala ${room.id}: ${participants.length} voto(s) → categoría ganadora: ${selectedCategoryId} (${maxCount} voto(s))`,
-        );
+      if (activeCategories.length > 0) {
+        return activeCategories[
+          Math.floor(Math.random() * activeCategories.length)
+        ].id;
       }
 
-      // Cerrar la votación y activar la partida (guarda selectedCategoryId).
-      const { count } = await this.prisma.room.updateMany({
-        where: { id: room.id, status: RoomStatus.VOTING },
-        data: {
-          status: RoomStatus.ACTIVE,
-          selectedCategoryId,
-        },
+      const anyCategory = await this.prisma.category.findFirst({
+        select: { id: true },
       });
 
-      if (count > 0) {
-        this.logger.log(
-          `Sala ${room.id} VOTING → ACTIVE (categoría: ${selectedCategoryId ?? 'N/A'})`,
-        );
+      return anyCategory?.id ?? null;
+    }
 
-        // Buffer de conexión: da tiempo a los clientes para montar la pantalla
-        // y conectar su WebSocket antes de la primera pregunta. La sala ya está
-        // en ACTIVE, así que el cron no la vuelve a procesar durante la espera.
-        const startTime = Date.now() + GAME_START_CONNECTION_BUFFER_MS;
-        this.gameplayGateway.startGameCountdown(room.id, startTime);
-        await delay(GAME_START_CONNECTION_BUFFER_MS);
+    // Contar votos por categoría.
+    const counts = new Map<string, number>();
+    const lastVotedAt = new Map<string, number>();
 
-        const started = await this.gameplayGateway.startQuestion(room.id);
+    for (const p of participants) {
+      const catId = p.votedCategoryId!;
+      counts.set(catId, (counts.get(catId) ?? 0) + 1);
 
-        if (!started) {
-          await this.gameplayGateway.finishGameWithAlive(room.id);
-        }
+      const t = p.votedAt?.getTime() ?? 0;
+      const prev = lastVotedAt.get(catId) ?? 0;
+      if (t > prev) lastVotedAt.set(catId, t);
+    }
+
+    let maxCount = 0;
+    for (const n of counts.values()) {
+      if (n > maxCount) maxCount = n;
+    }
+
+    const leaders = [...counts.entries()]
+      .filter(([, n]) => n === maxCount)
+      .map(([catId]) => catId);
+
+    // Desempate: MIN(MAX(votedAt)) → el último voto más temprano.
+    let bestCat = leaders[0];
+    let bestLastVote = lastVotedAt.get(bestCat) ?? Infinity;
+
+    for (const catId of leaders.slice(1)) {
+      const t = lastVotedAt.get(catId) ?? Infinity;
+      if (t < bestLastVote) {
+        bestCat = catId;
+        bestLastVote = t;
       }
     }
+
+    return bestCat;
   }
 
   // -----------------------------------------------------------------------
