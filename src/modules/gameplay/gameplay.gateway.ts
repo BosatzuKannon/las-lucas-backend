@@ -31,6 +31,13 @@ import { WsGameplayExceptionsFilter } from './ws-exceptions.filter';
 export interface GameplaySocketData {
   user?: AuthUser;
   roomId?: string;
+  /**
+   * Promesa de autenticación del handshake (JWKS async). El cliente emite
+   * `join_room` apenas recibe 'connect', que puede llegar ANTES de que
+   * `handleConnection` resuelva el usuario: `joinRoom` espera por este
+   * promise en lugar de leer `user` a ciegas (carrera → user=NULO).
+   */
+  authPromise?: Promise<AuthUser | null>;
 }
 
 export interface JoinRoomAckData {
@@ -89,31 +96,40 @@ export class GameplayGateway
 
     if (!token) {
       this.logger.warn('Conexión rechazada al namespace /gameplay: sin token.');
+      client.data.authPromise = Promise.resolve(null);
       client.disconnect(true);
       return;
     }
 
-    try {
-      const user = await this.socketAuth.verifyToken(token);
+    // La verificación queda disponible para `joinRoom` desde el primer tick:
+    // se expone la promesa ANTES del primer await para que los mensajes que
+    // lleguen durante la verificación puedan esperarla y no ver un user=NULO.
+    client.data.authPromise = this.socketAuth
+      .verifyToken(token)
+      .then((user) => {
+        if (!user || !user.sub) {
+          this.logger.warn(
+            'Conexión rechazada al namespace /gameplay: token JWT inválido o expirado.',
+          );
+          client.disconnect(true);
+          return null;
+        }
 
-      if (!user || !user.sub) {
-        this.logger.warn(
-          'Conexión rechazada al namespace /gameplay: token JWT inválido o expirado.',
+        client.data.user = { sub: user.sub, email: user.email };
+        return user;
+      })
+      .catch((error) => {
+        this.logger.error(
+          `Error al autenticar conexión al namespace /gameplay: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+          error instanceof Error ? error.stack : undefined,
         );
         client.disconnect(true);
-        return;
-      }
+        return null;
+      });
 
-      client.data.user = { sub: user.sub, email: user.email };
-    } catch (error) {
-      this.logger.error(
-        `Error al autenticar conexión al namespace /gameplay: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-        error instanceof Error ? error.stack : undefined,
-      );
-      client.disconnect(true);
-    }
+    await client.data.authPromise;
   }
 
   handleDisconnect(client: GameplaySocket): void {
@@ -132,12 +148,17 @@ export class GameplayGateway
       `[join_room] ENTRADA id=${client.id} user=${client.data.user?.sub ?? 'NULO'} payload=${JSON.stringify(dto)} hora=${new Date().toISOString()}`,
     );
 
-    const user = client.data.user;
+    // Espera a que termine la verificación del handshake (JWKS). Sin esto, el
+    // join_room emitido en el tick de 'connect' podía ver user=NULO y ser
+    // rechazado aunque el token fuera válido.
+    const user =
+      client.data.user ??
+      (await (client.data.authPromise ?? Promise.resolve(null)));
 
     if (!user) {
       // Defensa: nunca lanzar una excepción no controlada (dejaría al cliente
       // sin ack hasta su timeout). Se devuelve un ack de rechazo explícito.
-      return this.rejectJoinRoom(dto.roomId, 'NOT_AUTHENTICATED');
+      return this.rejectJoinRoom(client, dto.roomId, 'NOT_AUTHENTICATED');
     }
 
     try {
@@ -152,7 +173,7 @@ export class GameplayGateway
           `[join_room] ${user.sub} no es participante de la sala ${dto.roomId}`,
         );
         client.emit('error', { message: 'No eres participante de esta sala' });
-        return this.rejectJoinRoom(dto.roomId, 'NOT_PARTICIPANT');
+        return this.rejectJoinRoom(client, dto.roomId, 'NOT_PARTICIPANT');
       }
 
       await client.join(dto.roomId);
@@ -165,14 +186,21 @@ export class GameplayGateway
         `[join_room] ACK_ENVIADO ok user=${user.sub} room=${dto.roomId} activeQ=${activeQuestion?.questionId ?? 'ninguna'} start=${gameStarting?.startTime ?? null}`,
       );
 
+      // Doble vía de respuesta para no depender del canal de ack packet de
+      // socket.io (que se estaba perdiendo en producción): se devuelve el
+      // envelope (auto-ack de NestJS) Y se emite `join_response` como evento
+      // normal punto-a-punto, que replica la fiabilidad de los broadcasts.
+      const ackData: JoinRoomAckData = {
+        ok: true,
+        roomId: dto.roomId,
+        activeQuestion,
+        gameStarting,
+      };
+      client.emit('join_response', ackData);
+
       return {
         event: 'join_room',
-        data: {
-          ok: true,
-          roomId: dto.roomId,
-          activeQuestion,
-          gameStarting,
-        },
+        data: ackData,
       };
     } catch (error) {
       this.logger.error(
@@ -181,23 +209,28 @@ export class GameplayGateway
         }`,
         error instanceof Error ? error.stack : undefined,
       );
-      return this.rejectJoinRoom(dto.roomId, 'SERVER_ERROR');
+      return this.rejectJoinRoom(client, dto.roomId, 'SERVER_ERROR');
     }
   }
 
   private rejectJoinRoom(
+    client: GameplaySocket,
     roomId: string,
     reason: NonNullable<JoinRoomAckData['reason']>,
   ): JoinRoomAck {
+    const ackData: JoinRoomAckData = {
+      ok: false,
+      roomId,
+      reason,
+      activeQuestion: null,
+      gameStarting: null,
+    };
+
+    client.emit('join_response', ackData);
+
     return {
       event: 'join_room',
-      data: {
-        ok: false,
-        roomId,
-        reason,
-        activeQuestion: null,
-        gameStarting: null,
-      },
+      data: ackData,
     };
   }
 
