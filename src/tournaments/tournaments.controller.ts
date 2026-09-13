@@ -15,6 +15,7 @@ import type {
   GetHistoryGlobalDto,
   GetHistoryMeDto,
   GetHistoryStatsDto,
+  GetLeaderboardDto,
 } from './dto/history.dto';
 import { TournamentsService } from './tournaments.service';
 
@@ -47,6 +48,14 @@ export class TournamentsController {
   @UseGuards(JwtAuthGuard)
   getHistoryMe(@Req() req: AuthenticatedRequest): Promise<GetHistoryMeDto> {
     return this.tournamentsService.getHistoryMe(req.user.sub);
+  }
+
+  @Get(':id/leaderboard')
+  @UseGuards(JwtAuthGuard)
+  getLeaderboard(
+    @Param('id') roomId: string,
+  ): Promise<GetLeaderboardDto> {
+    return this.tournamentsService.getLeaderboard(roomId);
   }
 
   @Get(':id/waiting-room')

@@ -17,6 +17,25 @@ export interface HistoryPodiumEntry {
   prizeWon: number;
 }
 
+/** Entrada de la tabla completa (leaderboard) de un torneo finalizado. */
+export interface LeaderboardEntryDto extends HistoryPodiumEntry {
+  /** id del usuario real (para resaltar al usuario autenticado en el modal). */
+  userId: string;
+}
+
+/** GET /tournaments/:id/leaderboard — lista completa de ganadores. */
+export interface GetLeaderboardDto {
+  roomId: string;
+  displayName: string;
+  prizePool: number;
+  /** ISO del inicio programado. */
+  startDate: string;
+  /** Número total de jugadores con posición liquidada. */
+  totalPlayers: number;
+  /** Tabla completa ordenada por posición (todas las posiciones). */
+  entries: LeaderboardEntryDto[];
+}
+
 /** GET /tournaments/history/stats — Resumen Competitivo del usuario. */
 export interface GetHistoryStatsDto {
   /** Veces que participó en torneos cerrados (FINISHED o CANCELLED). */

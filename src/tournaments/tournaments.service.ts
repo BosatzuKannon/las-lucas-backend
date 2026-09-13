@@ -18,6 +18,7 @@ import {
   GetHistoryGlobalDto,
   GetHistoryMeDto,
   GetHistoryStatsDto,
+  GetLeaderboardDto,
 } from './dto/history.dto';
 
 /** Ventana de espera de la sala de espera (10 minutos). */
@@ -204,6 +205,53 @@ export class TournamentsService {
         myPrizeWon: p.prizeWon,
         fullyRefunded: p.room.status === RoomStatus.CANCELLED,
         referenceId: p.roomId,
+      })),
+    };
+  }
+
+  /**
+   * Tabla completa de ganadores de un torneo FINISHED (todas las posiciones,
+   * sin el tope `take: 4` del podio). Se consulta bajo demanda al abrir el
+   * modal "Ver tabla completa" del historial.
+   */
+  async getLeaderboard(roomId: string): Promise<GetLeaderboardDto> {
+    const room = await this.prisma.room.findUnique({
+      where: { id: roomId },
+      select: {
+        status: true,
+        tournamentType: true,
+        prizePool: true,
+        startTime: true,
+      },
+    });
+
+    if (!room) {
+      throw new NotFoundException('Sala de torneo no encontrada');
+    }
+
+    if (room.status !== RoomStatus.FINISHED) {
+      throw new BadRequestException(
+        'La tabla completa solo está disponible para torneos finalizados',
+      );
+    }
+
+    const entries = await this.prisma.roomParticipant.findMany({
+      where: { roomId, position: { not: null } },
+      orderBy: [{ position: 'asc' }, { prizeWon: 'desc' }, { userId: 'asc' }],
+    });
+
+    return {
+      roomId,
+      displayName: tournamentDisplayName(room.tournamentType),
+      prizePool: room.prizePool,
+      startDate: room.startTime.toISOString(),
+      totalPlayers: entries.length,
+      entries: entries.map((p) => ({
+        userId: p.userId,
+        position: p.position!,
+        userName: p.userName,
+        score: p.score,
+        prizeWon: p.prizeWon,
       })),
     };
   }
