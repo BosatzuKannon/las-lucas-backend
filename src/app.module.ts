@@ -9,6 +9,7 @@ import { KeepAliveModule } from './modules/keep-alive/keep-alive.module';
 import { GameplayModule } from './modules/gameplay/gameplay.module';
 import { TournamentsModule } from './tournaments/tournaments.module';
 import { CategoriesModule } from './categories/categories.module';
+import { SeasonsModule } from './seasons/seasons.module';
 
 @Module({
   imports: [
@@ -20,6 +21,7 @@ import { CategoriesModule } from './categories/categories.module';
     GameplayModule,
     TournamentsModule,
     CategoriesModule,
+    SeasonsModule,
   ],
   controllers: [AppController],
   providers: [AppService],
