@@ -5,7 +5,7 @@ generator client {
 datasource db {
   provider  = "postgresql"
   url       = env("DATABASE_URL")
-  directUrl = env("DIRECT_URL")  
+  directUrl = env("DIRECT_URL")
 }
 
 // --- ENUMS ---
@@ -53,27 +53,27 @@ enum SeasonStatus {
 
 // --- MODELS ---
 model User {
-  id                     String          @id @default(uuid())
-  googleId               String          @unique @map("google_id")
-  email                  String          @unique
+  id                     String     @id @default(uuid())
+  googleId               String     @unique @map("google_id")
+  email                  String     @unique
   name                   String
-  avatarUrl              String?         @map("avatar_url")
-  status                 UserStatus      @default(ACTIVE)
-  balanceLucas           Float           @default(0) @map("balance_lucas")
-  globalPoints           Int             @default(0) @map("global_points")
-  isPro                  Boolean         @default(false) @map("is_pro")
-  isVerified             Boolean         @default(false) @map("is_verified")
+  avatarUrl              String?    @map("avatar_url")
+  status                 UserStatus @default(ACTIVE)
+  balanceLucas           Float      @default(0) @map("balance_lucas")
+  globalPoints           Int        @default(0) @map("global_points")
+  isPro                  Boolean    @default(false) @map("is_pro")
+  isVerified             Boolean    @default(false) @map("is_verified")
   phone                  String?
-  identificationDocument String?         @map("identification_document")
-  createdAt              DateTime        @default(now()) @map("created_at")
-  updatedAt              DateTime        @updatedAt @map("updated_at")
+  identificationDocument String?    @map("identification_document")
+  createdAt              DateTime   @default(now()) @map("created_at")
+  updatedAt              DateTime   @updatedAt @map("updated_at")
 
   // Relations
-  device                 Device?
-  preference             UserPreference?
-  transactions           Transaction[]
-  roomParticipations     RoomParticipant[]
-  seasonWins             SeasonWinner[]
+  device             Device?
+  preference         UserPreference?
+  transactions       Transaction[]
+  roomParticipations RoomParticipant[]
+  seasonWins         SeasonWinner[]
 
   @@map("users")
 }
@@ -85,7 +85,7 @@ model Device {
   deviceInfo Json?    @map("device_info")
   lastLogin  DateTime @default(now()) @map("last_login")
 
-  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@map("devices")
 }
@@ -96,37 +96,37 @@ model UserPreference {
   emailNotifications Boolean @default(true) @map("email_notifications")
   pushNotifications  Boolean @default(true) @map("push_notifications")
 
-  user               User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@map("user_preferences")
 }
 
 model Transaction {
-  id                 String            @id @default(uuid())
-  userId             String            @map("user_id")
-  amount             Float
-  transactionType    TransactionType   @map("transaction_type")
-  status             TransactionStatus @default(PENDING)
-  reference          String?           @unique
-  wompiTransactionId String?           @unique @map("wompi_transaction_id")
-  paymentMethodType  String?           @map("payment_method_type")
-  paymentMethodExtra Json?             @map("payment_method_extra")
-  createdAt          DateTime          @default(now()) @map("created_at")
+  id                    String            @id @default(uuid())
+  userId                String            @map("user_id")
+  amount                Float
+  transactionType       TransactionType   @map("transaction_type")
+  status                TransactionStatus @default(PENDING)
+  reference             String?           @unique
+  externalTransactionId String?           @unique @map("external_transaction_id")
+  paymentMethodType     String?           @map("payment_method_type")
+  paymentMethodExtra    Json?             @map("payment_method_extra")
+  createdAt             DateTime          @default(now()) @map("created_at")
 
-  user               User              @relation(fields: [userId], references: [id], onDelete: Restrict)
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
 
   @@map("transactions")
 }
 
 model Room {
-  id             String         @id @default(uuid())
-  tournamentType TournamentType @map("tournament_type")
-  status         RoomStatus     @default(SCHEDULED)
-  selectedCategoryId String?    @map("selected_category_id")
-  entryFee       Float          @map("entry_fee")
-  extraLifeFee   Float          @map("extra_life_fee")
-  prizePool      Float          @map("prize_pool")
-  startTime      DateTime       @map("start_time")
+  id                       String         @id @default(uuid())
+  tournamentType           TournamentType @map("tournament_type")
+  status                   RoomStatus     @default(SCHEDULED)
+  selectedCategoryId       String?        @map("selected_category_id")
+  entryFee                 Float          @map("entry_fee")
+  extraLifeFee             Float          @map("extra_life_fee")
+  prizePool                Float          @map("prize_pool")
+  startTime                DateTime       @map("start_time")
   maxPlayers               Int            @map("max_players")
   currentPlayers           Int            @default(0) @map("current_players")
   normalQuestionCount      Int            @map("normal_question_count")
@@ -135,38 +135,38 @@ model Room {
 
   // Deadlines de fase (mensurables, calculados). `startTime` ES INMUTABLE:
   // solo se trabaja con estos campos + aritmética de fechas.
-  waitingClosesAt DateTime?  @map("waiting_closes_at")
-  votingClosesAt  DateTime?  @map("voting_closes_at")
+  waitingClosesAt DateTime? @map("waiting_closes_at")
+  votingClosesAt  DateTime? @map("voting_closes_at")
   // Avance de preguntas persistido (sobrevive reinicios del servidor).
-  questionCursor  Int        @default(0) @map("question_cursor")
-  survivalMode    Boolean    @default(false) @map("survival_mode")
-  
-  createdAt      DateTime       @default(now()) @map("created_at")
+  questionCursor  Int       @default(0) @map("question_cursor")
+  survivalMode    Boolean   @default(false) @map("survival_mode")
 
-  participants   RoomParticipant[]
+  createdAt DateTime @default(now()) @map("created_at")
+
+  participants RoomParticipant[]
 
   @@map("rooms")
 }
 
 model Category {
-  id        String     @id @default(uuid())
-  name      String     @unique
-  isActive  Boolean    @default(true) @map("is_active")
-  
+  id       String  @id @default(uuid())
+  name     String  @unique
+  isActive Boolean @default(true) @map("is_active")
+
   questions Question[]
 
   @@map("categories")
 }
 
 model Question {
-  id            String   @id @default(uuid())
-  categoryId    String   @map("category_id")
+  id            String @id @default(uuid())
+  categoryId    String @map("category_id")
   text          String
-  correctAnswer String   @map("correct_answer")
+  correctAnswer String @map("correct_answer")
   options       Json
-  difficulty    Int      @default(1)
-  
-  category      Category @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  difficulty    Int    @default(1)
+
+  category Category @relation(fields: [categoryId], references: [id], onDelete: Restrict)
 
   @@map("questions")
 }
@@ -181,12 +181,12 @@ model RoomParticipant {
   // Resultado final de la sala (se rellena únicamente en la liquidación).
   // `position` usa ranking de competición (empates comparten posición): todos
   // los ganadores son posición 1. Permanece null mientras la sala no se liquida.
-  position              Int?    @map("position")
+  position             Int?  @map("position")
   // Porción del pozo ganada en esta sala. 0 para los no premiados.
-  prizeWon              Float   @default(0) @map("prize_won")
+  prizeWon             Float @default(0) @map("prize_won")
   // Ronda (1-based) en la que el jugador fue eliminado. Permite reconstruir
   // las posiciones tras un reinicio del servidor. null si nunca fue eliminado.
-  eliminatedAtQuestion  Int?    @map("eliminated_at_question")
+  eliminatedAtQuestion Int?  @map("eliminated_at_question")
 
   // Votación de categoría en vivo (fase VOTING).
   votedCategoryId String?   @map("voted_category_id")
@@ -198,8 +198,8 @@ model RoomParticipant {
   userName      String  @map("user_name")
   userAvatarUrl String? @map("user_avatar_url")
 
-  room                  Room    @relation(fields: [roomId], references: [id], onDelete: Cascade)
-  user                  User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  room Room @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@id([roomId, userId])
   @@map("room_participants")
@@ -227,23 +227,23 @@ model Season {
   createdAt        DateTime     @default(now()) @map("created_at")
   updatedAt        DateTime     @updatedAt @map("updated_at")
 
-  seasonWinners    SeasonWinner[]
+  seasonWinners SeasonWinner[]
 
   @@map("seasons")
 }
 
 model SeasonWinner {
-  id           String    @id @default(uuid())
-  seasonId     String    @map("season_id")
-  userId       String    @map("user_id")
-  position     Int
-  prizeWon     Float     @map("prize_won")
+  id            String   @id @default(uuid())
+  seasonId      String   @map("season_id")
+  userId        String   @map("user_id")
+  position      Int
+  prizeWon      Float    @map("prize_won")
   pointsAtClose Int      @map("points_at_close")
-  createdAt    DateTime  @default(now()) @map("created_at")
-  updatedAt    DateTime  @updatedAt @map("updated_at")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
 
-  season       Season    @relation(fields: [seasonId], references: [id], onDelete: Cascade)
-  user         User      @relation(fields: [userId], references: [id], onDelete: Restrict)
+  season Season @relation(fields: [seasonId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
 
   @@unique([seasonId, position])
   @@map("season_winners")

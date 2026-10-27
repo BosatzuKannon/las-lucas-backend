@@ -10,6 +10,7 @@ import { GameplayModule } from './modules/gameplay/gameplay.module';
 import { TournamentsModule } from './tournaments/tournaments.module';
 import { CategoriesModule } from './categories/categories.module';
 import { SeasonsModule } from './seasons/seasons.module';
+import { MercadoPagoModule } from './modules/mercado-pago/mercado-pago.module';
 
 @Module({
   imports: [
@@ -22,6 +23,7 @@ import { SeasonsModule } from './seasons/seasons.module';
     TournamentsModule,
     CategoriesModule,
     SeasonsModule,
+    MercadoPagoModule,
   ],
   controllers: [AppController],
   providers: [AppService],
